@@ -161,17 +161,32 @@ fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
 }
 
 fn spawn_warp_split(script: &Path) -> Result<()> {
-    let status = Command::new("osascript")
+    let keystroke = Command::new("osascript")
         .arg("-e")
         .arg(warp_split_script(script))
+        .status();
+    if keystroke.as_ref().is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+    spawn_warp_tab(script)
+}
+
+fn spawn_warp_tab(script: &Path) -> Result<()> {
+    let home = env::var_os("HOME").context("HOME is unset")?;
+    let dir = PathBuf::from(home).join(".warp/tab_configs");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join("trv-review.toml");
+    fs::write(&path, warp_tab_config(script))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    let status = Command::new("open")
+        .arg("warp://tab_config/trv-review")
         .status()
-        .context("failed to split the Warp pane")?;
+        .context("failed to open a Warp tab for the review")?;
     if status.success() {
         Ok(())
     } else {
-        bail!(
-            "could not split this Warp window (osascript exited with {status}). Grant Accessibility to osascript/Warp, or run inside tmux."
-        )
+        let _ = fs::remove_file(&path);
+        bail!("failed to open a Warp tab for the review ({status})")
     }
 }
 
@@ -183,6 +198,21 @@ fn tmux_split_args(cwd: &Path, script: &Path) -> Vec<String> {
         cwd.display().to_string(),
         format!("sh {}", shell_single_quote(&script.display().to_string())),
     ]
+}
+
+fn warp_tab_config(script: &Path) -> String {
+    let command = format!(
+        "exec sh {}",
+        shell_single_quote(&script.display().to_string())
+    );
+    format!(
+        "name = \"trv review\"\ntitle = \"trv\"\n\n[[panes]]\nid = \"review\"\ntype = \"terminal\"\ncommands = [{}]\nis_focused = true\n",
+        toml_quote(&command)
+    )
+}
+
+fn toml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn warp_split_script(script: &Path) -> String {
@@ -264,7 +294,9 @@ fn applescript_quote(value: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{Launch, launch_plan, runner_script, tmux_split_args, warp_split_script};
+    use super::{
+        Launch, launch_plan, runner_script, tmux_split_args, warp_split_script, warp_tab_config,
+    };
 
     #[test]
     fn a_real_tty_runs_in_place() {
@@ -285,6 +317,14 @@ mod tests {
         assert!(script.contains("exec sh '/tmp/trv-agent/run.sh'"));
         assert!(script.contains("warp.Warp"));
         assert!(!script.contains("Terminal.app"));
+    }
+
+    #[test]
+    fn warp_tab_config_runs_the_review_in_this_app() {
+        let config = warp_tab_config(Path::new("/tmp/trv-agent/run.sh"));
+        assert!(config.contains("type = \"terminal\""));
+        assert!(config.contains("exec sh '/tmp/trv-agent/run.sh'"));
+        assert!(!config.contains("Terminal.app"));
     }
 
     #[test]

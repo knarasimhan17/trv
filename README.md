@@ -66,8 +66,9 @@ the next immutable revision for the current repository and branch.
 
 `trv --agent` (or `trv --stdout`) is the agent loop. If this process owns a
 tty, the review runs in place. If an agent captured stdin/stdout (no tty),
-it splits this window — a tmux pane, or a Warp pane via ⌘D — and runs the
-review there. Add comments as usual, then press `q`. Quitting submits
+it splits this window (tmux, or Warp ⌘D when allowed) and runs the review
+there. If Warp blocks keystrokes, it opens a new tab in this Warp window
+instead. Add comments as usual, then press `q`. Quitting submits
 whatever comments you left on stdout and unblocks the agent. Empty stdout
 means you accepted the diff; that does not create a revision. Non-empty
 comments persist the next immutable revision, same as a manual `y` export.
