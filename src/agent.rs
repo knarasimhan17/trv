@@ -55,11 +55,20 @@ pub(crate) fn inner_handoff() -> Option<Handoff> {
     Some(Handoff { sink, done })
 }
 
-pub(crate) fn launch_plan(inner: bool, direct_tty: bool, host: Option<Launch>) -> Launch {
+pub(crate) fn launch_plan(
+    inner: bool,
+    direct_tty: bool,
+    host: Option<Launch>,
+    macos: bool,
+) -> Launch {
     if inner || direct_tty {
         Launch::Here
+    } else if let Some(host) = host {
+        host
+    } else if macos {
+        Launch::TerminalApp
     } else {
-        host.unwrap_or(Launch::Here)
+        Launch::Here
     }
 }
 
@@ -69,6 +78,7 @@ pub(crate) fn should_spawn() -> bool {
             inner_handoff().is_some(),
             io::stdin().is_terminal() && io::stdout().is_terminal(),
             detect_host(),
+            cfg!(target_os = "macos"),
         ),
         Launch::Here
     )
@@ -88,7 +98,7 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
     )
     .with_context(|| format!("failed to write {}", script.display()))?;
 
-    match launch_plan(false, false, detect_host()) {
+    match launch_plan(false, false, detect_host(), cfg!(target_os = "macos")) {
         Launch::Tmux => spawn_tmux(&cwd, &script)?,
         Launch::Warp => spawn_warp_tab(&script)?,
         Launch::ITerm => spawn_iterm_tab(&script)?,
@@ -96,7 +106,7 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
         Launch::TerminalApp => spawn_terminal_app(&script)?,
         Launch::WezTerm => spawn_wezterm_tab(&cwd, &script)?,
         Launch::Here => bail!(
-            "trv --agent needs a tab in this window. Run it from a tty, or inside Warp, tmux, iTerm, Kitty, WezTerm, or Terminal.app."
+            "trv --agent needs a visible terminal. Run it from a tty, inside Warp, tmux, iTerm, Kitty, or WezTerm, or on macOS (falls back to Terminal.app)."
         ),
     }
 
@@ -292,7 +302,7 @@ fn terminal_app_script(script: &Path) -> String {
         shell_single_quote(&script.display().to_string())
     );
     format!(
-        "tell application \"Terminal\"\ndo script {} in front window\nend tell",
+        "tell application \"Terminal\"\ndo script {}\nend tell",
         applescript_quote(&command)
     )
 }
@@ -388,29 +398,51 @@ mod tests {
 
     #[test]
     fn a_real_tty_runs_in_place() {
-        assert_eq!(launch_plan(true, false, Some(Launch::Warp)), Launch::Here);
-        assert_eq!(launch_plan(false, true, Some(Launch::ITerm)), Launch::Here);
+        assert_eq!(
+            launch_plan(true, false, Some(Launch::Warp), true),
+            Launch::Here
+        );
+        assert_eq!(
+            launch_plan(false, true, Some(Launch::ITerm), true),
+            Launch::Here
+        );
     }
 
     #[test]
     fn agents_without_a_tty_open_a_tab_in_this_window() {
-        assert_eq!(launch_plan(false, false, Some(Launch::Tmux)), Launch::Tmux);
-        assert_eq!(launch_plan(false, false, Some(Launch::Warp)), Launch::Warp);
         assert_eq!(
-            launch_plan(false, false, Some(Launch::ITerm)),
+            launch_plan(false, false, Some(Launch::Tmux), true),
+            Launch::Tmux
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::Warp), true),
+            Launch::Warp
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::ITerm), true),
             Launch::ITerm
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::Kitty)),
+            launch_plan(false, false, Some(Launch::Kitty), true),
             Launch::Kitty
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::TerminalApp)),
-            Launch::TerminalApp
+            launch_plan(false, false, Some(Launch::WezTerm), true),
+            Launch::WezTerm
+        );
+    }
+
+    #[test]
+    fn macos_falls_back_to_terminal_app() {
+        assert_eq!(
+            launch_plan(false, false, None, true),
+            Launch::TerminalApp,
+            "unknown hosts on macOS must still get a Terminal.app window"
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::WezTerm)),
-            Launch::WezTerm
+            launch_plan(false, false, None, false),
+            Launch::Here,
+            "non-macOS without a known host cannot invent a window"
         );
     }
 
@@ -463,11 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_app_runs_in_the_front_window() {
+    fn terminal_app_opens_a_new_window() {
         let script = terminal_app_script(Path::new("/tmp/run.sh"));
         assert!(script.contains("tell application \"Terminal\""));
         assert!(script.contains("do script"));
-        assert!(script.contains("in front window"));
+        assert!(
+            !script.contains("in front window"),
+            "fallback must create a window even if Terminal.app is not already open"
+        );
     }
 
     #[test]
