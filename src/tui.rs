@@ -4,7 +4,7 @@ mod diff_view;
 mod picker;
 mod review;
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result};
@@ -17,8 +17,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -30,7 +31,7 @@ use crate::session::{ReviewSession, ViewKind};
 
 pub(crate) use picker::{CommitPickerOutcome, run as run_picker};
 
-type TrvTerminal = Terminal<CrosstermBackend<TerminalWriter>>;
+type TrvTerminal = Terminal<SessionBackend>;
 
 enum TerminalWriter {
     Stdout(io::Stdout),
@@ -39,15 +40,10 @@ enum TerminalWriter {
 
 impl TerminalWriter {
     fn open() -> Result<Self> {
-        if io::stdout().is_terminal() {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
             Ok(Self::Stdout(io::stdout()))
         } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-                .map(Self::Tty)
-                .context("controlling terminal is unavailable")
+            Ok(Self::Tty(crate::tty::session_tty()?))
         }
     }
 
@@ -57,7 +53,17 @@ impl TerminalWriter {
             Self::Tty(file) => file
                 .try_clone()
                 .map(Self::Tty)
-                .context("failed to clone controlling terminal"),
+                .context("failed to clone session terminal"),
+        }
+    }
+
+    fn size_tty(&self) -> Result<Option<File>> {
+        match self {
+            Self::Stdout(_) => Ok(None),
+            Self::Tty(file) => file
+                .try_clone()
+                .map(Some)
+                .context("failed to clone session terminal"),
         }
     }
 }
@@ -595,41 +601,90 @@ pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<Review
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
-    attach_stdin_to_tty()?;
     let restore = TerminalWriter::open()?;
+    let size_tty = restore.size_tty()?;
     let output = restore.try_clone()?;
     let _terminal_mode = TerminalMode::enter(restore)?;
-    let backend = CrosstermBackend::new(output);
+    let backend = SessionBackend {
+        inner: CrosstermBackend::new(output),
+        size_tty,
+    };
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().context("failed to clear terminal")?;
     operation(&mut terminal)
 }
 
-fn attach_stdin_to_tty() -> Result<()> {
-    if io::stdin().is_terminal() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let tty = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .context("controlling terminal is unavailable")?;
-        // SAFETY: stdin is a pipe from the agent; keyboard input has to come
-        // from the controlling terminal. stdout stays the pipe so comments
-        // still return to the agent after the review.
-        let result = unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) };
-        if result < 0 {
-            return Err(io::Error::last_os_error())
-                .context("failed to attach stdin to the controlling terminal");
+struct SessionBackend {
+    inner: CrosstermBackend<TerminalWriter>,
+    size_tty: Option<File>,
+}
+
+impl SessionBackend {
+    fn measured_size(&self) -> io::Result<Size> {
+        if let Some(tty) = &self.size_tty
+            && let Ok((width, height)) = crate::tty::winsize(tty)
+        {
+            return Ok(Size { width, height });
         }
-        Ok(())
+        self.inner.size()
     }
-    #[cfg(not(unix))]
+}
+
+impl Backend for SessionBackend {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        anyhow::bail!("trv --agent requires a Unix controlling terminal")
+        self.inner.draw(content)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.measured_size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        match self.measured_size() {
+            Ok(size) => Ok(WindowSize {
+                columns_rows: size,
+                pixels: Size {
+                    width: 0,
+                    height: 0,
+                },
+            }),
+            Err(_) => self.inner.window_size(),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
     }
 }
 
