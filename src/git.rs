@@ -10,6 +10,14 @@ use chrono::{DateTime, Utc};
 
 // The picker targets recent work, and this caps both Git output and TUI memory.
 const RECENT_COMMIT_LIMIT: usize = 200;
+const MAINLINE_CANDIDATES: &[&str] = &[
+    "origin/main",
+    "origin/master",
+    "origin/trunk",
+    "main",
+    "master",
+    "trunk",
+];
 
 pub(crate) struct Repository {
     root: PathBuf,
@@ -30,6 +38,14 @@ pub(crate) struct PreparedReview {
     pub(crate) base_commit_sha: String,
     pub(crate) tree_sha: String,
     pub(crate) diff: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BranchStack {
+    pub(crate) mainline: String,
+    pub(crate) merge_base_sha: String,
+    pub(crate) head_sha: String,
+    pub(crate) commit_count: usize,
 }
 
 impl Repository {
@@ -104,6 +120,66 @@ impl Repository {
         }
 
         Ok(commits)
+    }
+
+    pub(crate) fn branch_stack(&self) -> Result<Option<BranchStack>> {
+        let Some(mainline) = self.detect_mainline()? else {
+            return Ok(None);
+        };
+        let head_sha = self.resolve_commit("HEAD")?;
+        let mainline_sha = self.resolve_commit(&mainline)?;
+        if mainline_sha == head_sha {
+            return Ok(None);
+        }
+        let merge_base_sha = match git_text(
+            &self.root,
+            &["merge-base", &mainline_sha, &head_sha],
+            None,
+            None,
+            false,
+        ) {
+            Ok(sha) => sha,
+            Err(_) => return Ok(None),
+        };
+        let count = git_text(
+            &self.root,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{mainline_sha}..{head_sha}"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .context("failed to count commits on this branch")?;
+        let commit_count = count
+            .parse::<usize>()
+            .with_context(|| format!("Git returned a non-numeric commit count: {count}"))?;
+        if commit_count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(BranchStack {
+            mainline,
+            merge_base_sha,
+            head_sha,
+            commit_count,
+        }))
+    }
+
+    pub(crate) fn prepare_branch_review(&self, stack: &BranchStack) -> Result<PreparedReview> {
+        let tree_sha = if self.has_uncommitted_changes()? {
+            self.capture_working_tree()?.1
+        } else {
+            self.commit_tree_sha(&stack.head_sha)?
+        };
+        let diff = self.diff_trees(&stack.merge_base_sha, &tree_sha)?;
+        Ok(PreparedReview {
+            base_commit_sha: stack.merge_base_sha.clone(),
+            tree_sha,
+            diff,
+        })
     }
 
     pub(crate) fn prepare_review(&self, revset: Option<&str>) -> Result<PreparedReview> {
@@ -245,6 +321,31 @@ impl Repository {
             false,
         )
         .with_context(|| format!("failed to resolve tree for {commit}"))
+    }
+
+    fn detect_mainline(&self) -> Result<Option<String>> {
+        if let Ok(name) = git_text(
+            &self.root,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+            None,
+            None,
+            false,
+        ) && self.resolve_commit(&name).is_ok()
+        {
+            return Ok(Some(name));
+        }
+
+        for candidate in MAINLINE_CANDIDATES {
+            if self.resolve_commit(candidate).is_ok() {
+                return Ok(Some((*candidate).to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     fn resolve_commit(&self, revision: &str) -> Result<String> {
@@ -534,6 +635,91 @@ docs: initial commit\0";
             status,
             vec![("local", true), ("pushed", false)],
             "only commits unreachable from remote-tracking refs must be marked unpushed"
+        );
+    }
+
+    #[test]
+    fn branch_stack_reviews_the_combined_commits_since_mainline() {
+        let directory =
+            tempfile::tempdir().expect("temporary repository creation must succeed for this test");
+        let root = directory.path();
+        run_git(root, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(root.join("file.rs"), "main\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "mainline"]);
+        let main_sha = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", &main_sha]);
+        run_git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(root, &["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(root.join("file.rs"), "main\none\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "one"]);
+        std::fs::write(root.join("file.rs"), "main\none\ntwo\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "two"]);
+
+        let repository =
+            Repository::discover(root).expect("the synthetic repository must be discoverable");
+        let stack = repository
+            .branch_stack()
+            .expect("branch stack must be readable")
+            .expect("a feature branch ahead of origin/main must have a stack");
+
+        assert_eq!(stack.mainline, "origin/main");
+        assert_eq!(stack.merge_base_sha, main_sha);
+        assert_eq!(stack.commit_count, 2);
+
+        let prepared = repository
+            .prepare_branch_review(&stack)
+            .expect("the combined branch review must be preparable");
+        assert_eq!(prepared.base_commit_sha, main_sha);
+        assert!(
+            prepared.diff.contains("+one") && prepared.diff.contains("+two"),
+            "the branch review must include every commit since mainline, got {}",
+            prepared.diff
+        );
+        assert!(
+            !prepared.diff.contains("-main"),
+            "the branch review must not invert mainline history: {}",
+            prepared.diff
+        );
+
+        std::fs::write(root.join("file.rs"), "main\none\ntwo\nplus\n").unwrap();
+        let dirty = repository
+            .prepare_branch_review(&stack)
+            .expect("uncommitted work must join the branch review");
+        assert!(
+            dirty.diff.contains("+plus") && dirty.diff.contains("+one"),
+            "a dirty feature branch must review uncommitted work against mainline: {}",
+            dirty.diff
+        );
+    }
+
+    #[test]
+    fn branch_stack_is_absent_when_head_is_the_mainline() {
+        let directory =
+            tempfile::tempdir().expect("temporary repository creation must succeed for this test");
+        let root = directory.path();
+        run_git(root, &["init", "--quiet", "-b", "main"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "--quiet", "-m", "mainline"],
+        );
+        let repository =
+            Repository::discover(root).expect("the synthetic repository must be discoverable");
+        assert_eq!(
+            repository
+                .branch_stack()
+                .expect("mainline detection must succeed"),
+            None,
+            "HEAD on main with no extra commits is not a stack"
         );
     }
 

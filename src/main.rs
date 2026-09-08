@@ -41,12 +41,17 @@ fn run() -> Result<()> {
         Some(Command::Revs) => print_revisions(&repository),
         None => {
             if cli.agent_mode() && agent::should_spawn() {
-                return agent::spawn_and_forward(cli.working_tree, cli.revset.as_deref());
+                return agent::spawn_and_forward(
+                    cli.working_tree,
+                    cli.branch,
+                    cli.revset.as_deref(),
+                );
             }
             run_review(
                 &repository,
                 cli.revset.as_deref(),
                 cli.working_tree,
+                cli.branch,
                 cli.agent_mode(),
             )
         }
@@ -71,12 +76,32 @@ fn run_review(
     repository: &Repository,
     revset: Option<&str>,
     working_tree: bool,
+    branch: bool,
     agent: bool,
 ) -> Result<()> {
     let thread = repository.current_thread()?;
-    match review_launch(revset, working_tree, repository.has_uncommitted_changes()?) {
+    let stack = repository.branch_stack()?;
+    match review_launch(
+        revset,
+        working_tree,
+        branch,
+        agent,
+        repository.has_uncommitted_changes()?,
+        stack.is_some(),
+    ) {
         ReviewLaunch::Direct { revset } => {
             let prepared = repository.prepare_review(revset.as_deref())?;
+            let session = open_review_session(repository, &thread, &prepared)?;
+            let outcome = tui::run(session, agent)?;
+            finish_review(repository, &thread, prepared, outcome, agent)
+        }
+        ReviewLaunch::Branch => {
+            let stack = stack.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "HEAD is not ahead of a mainline branch (origin/main, main, master, …)"
+                )
+            })?;
+            let prepared = repository.prepare_branch_review(&stack)?;
             let session = open_review_session(repository, &thread, &prepared)?;
             let outcome = tui::run(session, agent)?;
             finish_review(repository, &thread, prepared, outcome, agent)
@@ -85,6 +110,7 @@ fn run_review(
             let commits = repository.recent_commits()?;
             let outcome = tui::run_picker(
                 commits,
+                stack,
                 |target| {
                     let revset = format!("{}..{}", target.base_sha, target.source_sha);
                     repository.prepare_review(Some(&revset))
