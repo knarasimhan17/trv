@@ -14,11 +14,22 @@ pub(crate) struct Cli {
     #[arg(short = 'w', long, conflicts_with = "revset")]
     pub(crate) working_tree: bool,
 
+    /// Write comments to stdout. Alias for --agent.
     #[arg(long)]
     pub(crate) stdout: bool,
 
+    /// Open a review for an AI agent. Comments print on stdout when you quit.
+    #[arg(long)]
+    pub(crate) agent: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+impl Cli {
+    pub(crate) fn agent_mode(&self) -> bool {
+        self.agent || self.stdout
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -50,7 +61,25 @@ pub(crate) fn review_launch(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewLaunch, review_launch};
+    use clap::Parser;
+
+    use super::{Cli, ReviewLaunch, review_launch};
+
+    #[test]
+    fn agent_and_stdout_flags_enable_agent_mode() {
+        assert!(
+            Cli::parse_from(["trv", "--agent"]).agent_mode(),
+            "--agent must close the review loop"
+        );
+        assert!(
+            Cli::parse_from(["trv", "--stdout"]).agent_mode(),
+            "--stdout is an alias for --agent"
+        );
+        assert!(
+            !Cli::parse_from(["trv"]).agent_mode(),
+            "interactive reviews must keep clipboard export"
+        );
+    }
 
     #[test]
     fn dirty_working_tree_opens_uncommitted_changes() {
