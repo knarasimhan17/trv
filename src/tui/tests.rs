@@ -7,7 +7,7 @@ use crate::diff::{ParsedDiff, SideBySideRow};
 use crate::model::{Comment, Side};
 use crate::session::{FrozenReview, LiveReview, ReviewSession, ViewKind};
 
-use super::{App, DiffLayout, DiffRow, Mode, dock_bottom, footer_text, render};
+use super::{App, DiffLayout, DiffRow, Mode, ReviewOutcome, dock_bottom, footer_text, render};
 
 const LIVE_DIFF: &str = "\
 diff --git file.rs file.rs
@@ -1114,4 +1114,94 @@ fn same_tree_reopen_starts_on_the_frozen_revision() {
     assert_eq!(app.viewing, ViewKind::Frozen(1));
     assert_eq!(app.comments[0].body, "saved");
     assert!(app.read_only);
+}
+
+fn add_line_comment(app: &mut App, body: &str) {
+    let index = app
+        .diff_rows()
+        .iter()
+        .position(|row| match row {
+            DiffRow::Line { file, line } => app.diff.files[*file].lines[*line].anchor().is_some(),
+            _ => false,
+        })
+        .expect("fixture must have a commentable line");
+    app.select_diff(index);
+    app.start_comment();
+    let Mode::CommentInput { body: input, .. } = &mut app.mode else {
+        panic!("the fixture must open comment input");
+    };
+    input.push_str(body);
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[test]
+fn agent_quit_submits_comments_without_a_confirm_prompt() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    app.submit_on_quit = true;
+    add_line_comment(&mut app, "please rename this");
+
+    assert!(
+        footer_text(&app).contains("q send comments"),
+        "agent mode must tell the user that quit sends comments"
+    );
+    assert!(
+        !footer_text(&app).contains("v inline comments"),
+        "agent footer should prioritize sending comments over extra toggles"
+    );
+
+    let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    let Some(ReviewOutcome::Export(comments)) = outcome else {
+        panic!("q must submit comments to the agent instead of confirming quit");
+    };
+    assert_eq!(
+        comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>(),
+        ["please rename this"],
+        "quitting agent mode must return the live comments"
+    );
+    assert!(
+        !matches!(app.mode, Mode::QuitConfirm { .. }),
+        "agent mode must not ask to discard comments that are being sent"
+    );
+}
+
+#[test]
+fn agent_quit_with_no_comments_still_unblocks_the_agent() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    app.submit_on_quit = true;
+
+    let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    let Some(ReviewOutcome::Export(comments)) = outcome else {
+        panic!("q with no comments must still return an empty export");
+    };
+    assert!(
+        comments.is_empty(),
+        "accepting the diff must send an empty comment list, not a discard"
+    );
+}
+
+#[test]
+fn agent_quit_from_a_frozen_view_sends_the_live_draft_comments() {
+    let mut app = App::from_session(two_round_session());
+    app.submit_on_quit = true;
+    add_line_comment(&mut app, "on the draft");
+
+    app.viewing = ViewKind::Frozen(1);
+    app.load_view();
+    assert!(app.read_only, "frozen revisions stay read-only");
+
+    let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    let Some(ReviewOutcome::Export(comments)) = outcome else {
+        panic!("q from a frozen view must still submit the live draft");
+    };
+    assert_eq!(
+        comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>(),
+        ["on the draft"],
+        "comments belong to the current round even if the user browsed a frozen rev"
+    );
 }

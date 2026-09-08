@@ -165,6 +165,7 @@ pub(crate) fn run(
     commits: Vec<CommitLogEntry>,
     prepare: impl FnOnce(ReviewTarget) -> Result<PreparedReview>,
     into_session: impl FnOnce(&PreparedReview) -> Result<ReviewSession>,
+    submit_on_quit: bool,
 ) -> Result<CommitPickerOutcome> {
     with_terminal(move |terminal| {
         let mut picker = CommitPicker::new(commits);
@@ -172,7 +173,7 @@ pub(crate) fn run(
             PickerChoice::Review(target) => {
                 let prepared = prepare(target)?;
                 let session = into_session(&prepared)?;
-                let outcome = run_review(terminal, session)?;
+                let outcome = run_review(terminal, session, submit_on_quit)?;
                 Ok(CommitPickerOutcome::Reviewed { prepared, outcome })
             }
             PickerChoice::Quit => Ok(CommitPickerOutcome::Quit),

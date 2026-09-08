@@ -2,8 +2,8 @@
 
 `trv` is a terminal code-review tool for Git changes. It is designed around
 vim-style navigation, inline comments, and immutable local review revisions. It
-is built to close the loop with coding agents: an agent integration opens the
-review when the agent finishes, and exported comments flow back automatically.
+closes the loop with coding agents: `trv --agent` opens the review in a visible
+terminal, and quitting sends comments back on stdout so the agent can iterate.
 
 ## Revisions
 
@@ -45,7 +45,7 @@ trv
 trv -w
 trv -r <revset>
 trv revs
-trv --stdout
+trv --agent
 ```
 
 If the working tree has uncommitted changes, `trv` reviews them against `HEAD`
@@ -59,9 +59,23 @@ preselected to the commit's first parent.
 revision range directly. Both flags skip the picker. Exporting comments creates
 the next immutable revision for the current repository and branch.
 
-`trv revs` lists the stored revisions. `trv --stdout` writes exported comments
-to standard output instead of copying them to the clipboard, which lets an
-agent workflow consume them directly.
+`trv revs` lists the stored revisions.
+
+`trv --agent` (or `trv --stdout`) is the agent loop. It opens the review in a
+visible terminal: a tmux split when `TMUX` is set, or a new Terminal.app window
+on macOS. Add comments as usual, then press `q`. Quitting submits whatever
+comments you left on stdout and unblocks the agent. Empty stdout means you
+accepted the diff; that does not create a revision. Non-empty comments persist
+the next immutable revision, same as a manual `y` export.
+
+```sh
+REVIEW=$(trv --agent)
+# REVIEW is `path:line: body` blocks, or empty if you quit with no comments
+```
+
+The footer shows `q send comments` so it is obvious that quit returns the
+review to the agent. On Linux without tmux, `--agent` runs in the current
+terminal when a tty is available.
 
 In the picker, use `j`/`k` to move, `Enter` to select, and `q` or `Esc` to go
 back. Press `?` for the current picker's keybindings.
@@ -80,7 +94,8 @@ comment on the selected line, `l` to view comments, `r` to switch between the
 current review, the interdiff since the last revision (also commentable), and
 frozen revisions,
 `s` to toggle unified or side-by-side layout, `v` to show or hide inline
-comment rows, `y` to export, `?` to show context-aware help, and `q` to quit. While editing, `Enter` saves,
+comment rows, `y` to export, `?` to show context-aware help, and `q` to quit
+(`q` sends comments in `--agent` mode). While editing, `Enter` saves,
 `Esc` cancels, and `Ctrl-D` or an empty `Enter` deletes the comment. In the
 comment list, `c`/`Enter` edits and `d` deletes. Press `?`, `Esc`, or `q` to close help and
 return to the same screen. Unified layout is the default. In side-by-side

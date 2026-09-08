@@ -1,3 +1,4 @@
+mod agent;
 mod cli;
 mod diff;
 mod export;
@@ -8,7 +9,6 @@ mod session;
 mod tui;
 
 use std::env;
-use std::io::{self, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -33,17 +33,23 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let _handoff_guard = agent::HandoffGuard::from_env();
     let current_dir = env::current_dir().context("current directory is unavailable")?;
     let repository = Repository::discover(&current_dir)?;
 
     match cli.command {
         Some(Command::Revs) => print_revisions(&repository),
-        None => run_review(
-            &repository,
-            cli.revset.as_deref(),
-            cli.working_tree,
-            cli.stdout,
-        ),
+        None => {
+            if cli.agent_mode() && agent::should_spawn() {
+                return agent::spawn_and_forward(cli.working_tree, cli.revset.as_deref());
+            }
+            run_review(
+                &repository,
+                cli.revset.as_deref(),
+                cli.working_tree,
+                cli.agent_mode(),
+            )
+        }
     }
 }
 
@@ -65,15 +71,15 @@ fn run_review(
     repository: &Repository,
     revset: Option<&str>,
     working_tree: bool,
-    stdout: bool,
+    agent: bool,
 ) -> Result<()> {
     let thread = repository.current_thread()?;
     match review_launch(revset, working_tree, repository.has_uncommitted_changes()?) {
         ReviewLaunch::Direct { revset } => {
             let prepared = repository.prepare_review(revset.as_deref())?;
             let session = open_review_session(repository, &thread, &prepared)?;
-            let outcome = tui::run(session)?;
-            finish_review(repository, &thread, prepared, outcome, stdout)
+            let outcome = tui::run(session, agent)?;
+            finish_review(repository, &thread, prepared, outcome, agent)
         }
         ReviewLaunch::Picker => {
             let commits = repository.recent_commits()?;
@@ -84,13 +90,19 @@ fn run_review(
                     repository.prepare_review(Some(&revset))
                 },
                 |prepared| open_review_session(repository, &thread, prepared),
+                agent,
             )?;
 
             match outcome {
                 CommitPickerOutcome::Reviewed { prepared, outcome } => {
-                    finish_review(repository, &thread, prepared, outcome, stdout)
+                    finish_review(repository, &thread, prepared, outcome, agent)
                 }
-                CommitPickerOutcome::Quit => Ok(()),
+                CommitPickerOutcome::Quit => {
+                    if agent {
+                        agent::deliver("")?;
+                    }
+                    Ok(())
+                }
             }
         }
     }
@@ -101,26 +113,30 @@ fn finish_review(
     thread: &str,
     prepared: PreparedReview,
     outcome: ReviewOutcome,
-    stdout: bool,
+    agent: bool,
 ) -> Result<()> {
     let ReviewOutcome::Export(comments) = outcome else {
+        if agent {
+            agent::deliver("")?;
+        }
         return Ok(());
     };
+
+    if agent && comments.is_empty() {
+        return agent::deliver("");
+    }
 
     let revision = persist_revision(repository, thread, &prepared, comments)?;
     let formatted = format_comments(&revision.comments);
 
-    if stdout {
-        if !formatted.is_empty() {
-            let mut output = io::stdout().lock();
-            writeln!(output, "{formatted}").context("failed to write exported comments")?;
-        }
+    if agent {
+        agent::deliver(&formatted)?;
         eprintln!("saved rev-{}", revision.rev);
-    } else {
-        let method = copy_to_clipboard(&formatted)?;
-        eprintln!("saved rev-{}; copied comments via {method}", revision.rev);
+        return Ok(());
     }
 
+    let method = copy_to_clipboard(&formatted)?;
+    eprintln!("saved rev-{}; copied comments via {method}", revision.rev);
     Ok(())
 }
 

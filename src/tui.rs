@@ -4,7 +4,8 @@ mod diff_view;
 mod picker;
 mod review;
 
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
@@ -29,7 +30,53 @@ use crate::session::{ReviewSession, ViewKind};
 
 pub(crate) use picker::{CommitPickerOutcome, run as run_picker};
 
-type TrvTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+type TrvTerminal = Terminal<CrosstermBackend<TerminalWriter>>;
+
+enum TerminalWriter {
+    Stdout(io::Stdout),
+    Tty(File),
+}
+
+impl TerminalWriter {
+    fn open() -> Result<Self> {
+        if io::stdout().is_terminal() {
+            Ok(Self::Stdout(io::stdout()))
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .map(Self::Tty)
+                .context("controlling terminal is unavailable")
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Stdout(_) => Ok(Self::Stdout(io::stdout())),
+            Self::Tty(file) => file
+                .try_clone()
+                .map(Self::Tty)
+                .context("failed to clone controlling terminal"),
+        }
+    }
+}
+
+impl Write for TerminalWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(stdout) => stdout.write(buf),
+            Self::Tty(tty) => tty.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(stdout) => stdout.flush(),
+            Self::Tty(tty) => tty.flush(),
+        }
+    }
+}
 
 pub(crate) enum ReviewOutcome {
     Export(Vec<Comment>),
@@ -87,6 +134,7 @@ struct App {
     status: Option<String>,
     help: bool,
     diff_list: DiffListLayout,
+    submit_on_quit: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,6 +177,7 @@ impl App {
             status: None,
             help: false,
             diff_list: DiffListLayout::default(),
+            submit_on_quit: false,
         };
         app.load_view();
         app
@@ -200,14 +249,18 @@ impl App {
     }
 
     fn pending_comments(&self) -> usize {
+        self.live_comments().len()
+    }
+
+    fn live_comments(&self) -> Vec<Comment> {
         match self.viewing {
-            ViewKind::LiveMain | ViewKind::LiveSince(_) => self.comments.len(),
+            ViewKind::LiveMain | ViewKind::LiveSince(_) => self.comments.clone(),
             ViewKind::Frozen(_) => self
                 .session
                 .live
                 .as_ref()
-                .map(|live| live.comments.len())
-                .unwrap_or(0),
+                .map(|live| live.comments.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -537,20 +590,27 @@ impl App {
     }
 }
 
-pub(crate) fn run(session: ReviewSession) -> Result<ReviewOutcome> {
-    with_terminal(|terminal| run_review(terminal, session))
+pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<ReviewOutcome> {
+    with_terminal(|terminal| run_review(terminal, session, submit_on_quit))
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
-    let _terminal_mode = TerminalMode::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
+    let restore = TerminalWriter::open()?;
+    let output = restore.try_clone()?;
+    let _terminal_mode = TerminalMode::enter(restore)?;
+    let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().context("failed to clear terminal")?;
     operation(&mut terminal)
 }
 
-fn run_review(terminal: &mut TrvTerminal, session: ReviewSession) -> Result<ReviewOutcome> {
+fn run_review(
+    terminal: &mut TrvTerminal,
+    session: ReviewSession,
+    submit_on_quit: bool,
+) -> Result<ReviewOutcome> {
     let mut app = App::from_session(session);
+    app.submit_on_quit = submit_on_quit;
 
     loop {
         terminal
@@ -569,14 +629,16 @@ fn run_review(terminal: &mut TrvTerminal, session: ReviewSession) -> Result<Revi
 }
 
 struct TerminalMode {
+    restore: TerminalWriter,
     raw: bool,
     alternate: bool,
     mouse: bool,
 }
 
 impl TerminalMode {
-    fn enter() -> Result<Self> {
+    fn enter(restore: TerminalWriter) -> Result<Self> {
         let mut mode = Self {
+            restore,
             raw: false,
             alternate: false,
             mouse: false,
@@ -584,28 +646,28 @@ impl TerminalMode {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         mode.raw = true;
 
-        let mut output = io::stdout();
-        execute!(output, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        execute!(&mut mode.restore, EnterAlternateScreen)
+            .context("failed to enter alternate screen")?;
         mode.alternate = true;
-        execute!(output, EnableMouseCapture).context("failed to enable mouse capture")?;
+        execute!(&mut mode.restore, EnableMouseCapture)
+            .context("failed to enable mouse capture")?;
         mode.mouse = true;
-        execute!(output, Hide).context("failed to hide terminal cursor")?;
+        execute!(&mut mode.restore, Hide).context("failed to hide terminal cursor")?;
         Ok(mode)
     }
 }
 
 impl Drop for TerminalMode {
     fn drop(&mut self) {
-        let mut output = io::stdout();
         if self.mouse
-            && let Err(error) = execute!(output, DisableMouseCapture)
+            && let Err(error) = execute!(&mut self.restore, DisableMouseCapture)
         {
             eprintln!("trv: failed to disable mouse capture: {error}");
         }
         let screen_result = if self.alternate {
-            execute!(output, Show, LeaveAlternateScreen)
+            execute!(&mut self.restore, Show, LeaveAlternateScreen)
         } else {
-            execute!(output, Show)
+            execute!(&mut self.restore, Show)
         };
         if let Err(error) = screen_result {
             eprintln!("trv: failed to restore terminal screen: {error}");
@@ -703,13 +765,26 @@ fn footer_text(app: &App) -> String {
     let controls = match app.visible_view() {
         View::Diff => {
             let inline_state = if app.inline_comments { "on" } else { "off" };
-            format!(
-                "r revs | {} | s view: {} | v inline comments: {inline_state} | {}",
-                app.view_label(),
-                app.diff_layout.as_str(),
-                bindings::HELP_HINT
-            )
+            if app.submit_on_quit {
+                format!(
+                    "r revs | {} | q send comments | s view: {} | {}",
+                    app.view_label(),
+                    app.diff_layout.as_str(),
+                    bindings::HELP_HINT
+                )
+            } else {
+                format!(
+                    "r revs | {} | s view: {} | v inline comments: {inline_state} | {}",
+                    app.view_label(),
+                    app.diff_layout.as_str(),
+                    bindings::HELP_HINT
+                )
+            }
         }
+        View::Comments if app.submit_on_quit => format!(
+            "l/Tab/Esc review | q send comments | {}",
+            bindings::HELP_HINT
+        ),
         View::Comments => format!(
             "l/Tab/Esc review | y export | q quit | {}",
             bindings::HELP_HINT
