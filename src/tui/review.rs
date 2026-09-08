@@ -43,6 +43,12 @@ impl App {
                 column,
             ));
         }
+        if let Some(visual) = self.visual.clone() {
+            if self.row_visual_line(self.selected_row(), &visual).is_some() {
+                return;
+            }
+            self.visual = None;
+        }
         if let Some(comment) = super::diff_view::comment_index_at(self, column, row) {
             self.edit_comment(comment);
         } else if self.selected_line_is_change() {
@@ -98,12 +104,14 @@ impl App {
         if !self.ensure_writable() {
             return;
         }
-        let Some(anchor) = self.selected_anchor().cloned() else {
+        let Some((anchor, end_line)) = self.comment_range() else {
             self.status = Some("Select a changed or context line to comment.".to_owned());
             return;
         };
+        self.visual = None;
         self.mode = Mode::CommentInput {
             anchor,
+            end_line,
             body: String::new(),
             existing: None,
         };
@@ -117,12 +125,14 @@ impl App {
         let Some(comment) = self.comments.get(index) else {
             return;
         };
+        self.visual = None;
         self.mode = Mode::CommentInput {
             anchor: crate::diff::LineAnchor {
                 path: comment.path.clone(),
-                line: comment.line,
+                line: comment.start_line(),
                 side: comment.side,
             },
+            end_line: comment.end_line(),
             body: comment.body.clone(),
             existing: Some(index),
         };
@@ -170,11 +180,11 @@ impl App {
             self.status = Some("Select a line with a comment to delete.".to_owned());
             return;
         };
-        let Some(index) = self.comments.iter().rposition(|comment| {
-            comment.path == anchor.path
-                && comment.line == anchor.line
-                && comment.side == anchor.side
-        }) else {
+        let Some(index) = self
+            .comments
+            .iter()
+            .rposition(|comment| comment.covers(&anchor.path, anchor.line, anchor.side))
+        else {
             self.status = Some("No comment on this line.".to_owned());
             return;
         };
@@ -400,11 +410,21 @@ impl App {
             [old_anchor, new_anchor]
                 .into_iter()
                 .flatten()
-                .any(|anchor| {
-                    comment.path == anchor.path
-                        && comment.line == anchor.line
-                        && comment.side == anchor.side
-                })
+                .any(|anchor| comment.covers(&anchor.path, anchor.line, anchor.side))
+        })
+    }
+
+    pub(super) fn comments_ending_on_line<'a>(
+        &'a self,
+        line: &'a DiffLine,
+    ) -> impl Iterator<Item = &'a Comment> + 'a {
+        let old_anchor = line.anchor_on(Side::Old);
+        let new_anchor = line.anchor_on(Side::New);
+        self.comments.iter().filter(move |comment| {
+            [old_anchor, new_anchor]
+                .into_iter()
+                .flatten()
+                .any(|anchor| comment_ends_on_anchor(comment, anchor))
         })
     }
 
@@ -421,11 +441,7 @@ impl App {
                 [old_anchor, new_anchor]
                     .into_iter()
                     .flatten()
-                    .any(|anchor| {
-                        comment.path == anchor.path
-                            && comment.line == anchor.line
-                            && comment.side == anchor.side
-                    })
+                    .any(|anchor| comment_ends_on_anchor(comment, anchor))
                     .then_some(index)
             })
     }
@@ -435,11 +451,16 @@ impl App {
         anchor: Option<&'a LineAnchor>,
     ) -> impl Iterator<Item = &'a Comment> + 'a {
         self.comments.iter().filter(move |comment| {
-            anchor.is_some_and(|anchor| {
-                comment.path == anchor.path
-                    && comment.line == anchor.line
-                    && comment.side == anchor.side
-            })
+            anchor.is_some_and(|anchor| comment.covers(&anchor.path, anchor.line, anchor.side))
+        })
+    }
+
+    pub(super) fn comments_ending_on_anchor<'a>(
+        &'a self,
+        anchor: Option<&'a LineAnchor>,
+    ) -> impl Iterator<Item = &'a Comment> + 'a {
+        self.comments.iter().filter(move |comment| {
+            anchor.is_some_and(|anchor| comment_ends_on_anchor(comment, anchor))
         })
     }
 
@@ -452,12 +473,196 @@ impl App {
             .enumerate()
             .filter_map(move |(index, comment)| {
                 anchor
-                    .is_some_and(|anchor| {
-                        comment.path == anchor.path
-                            && comment.line == anchor.line
-                            && comment.side == anchor.side
-                    })
+                    .is_some_and(|anchor| comment_ends_on_anchor(comment, anchor))
                     .then_some(index)
             })
     }
+
+    pub(super) fn toggle_visual(&mut self) {
+        if self.cancel_visual() {
+            return;
+        }
+        if !self.ensure_writable() {
+            return;
+        }
+        let Some(anchor) = self.selected_anchor().cloned() else {
+            self.status = Some("Select a changed or context line to start a range.".to_owned());
+            return;
+        };
+        let file = match self.selected_row() {
+            Some(DiffRow::Line { file, .. } | DiffRow::SideBySide { file, .. }) => file,
+            Some(DiffRow::File(_)) | None => {
+                self.status = Some("Select a changed or context line to start a range.".to_owned());
+                return;
+            }
+        };
+        self.selected_side = anchor.side;
+        self.visual = Some(super::VisualRange {
+            origin: self.selected_diff,
+            file,
+            side: anchor.side,
+            path: anchor.path,
+        });
+        self.status = None;
+    }
+
+    pub(super) fn cancel_visual(&mut self) -> bool {
+        if self.visual.take().is_some() {
+            self.status = Some("Range canceled.".to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn move_visual_or_diff(&mut self, down: bool) {
+        if self.visual.is_some() {
+            self.move_visual(down);
+        } else if down {
+            self.move_diff_down();
+        } else {
+            self.move_diff_up();
+        }
+    }
+
+    pub(super) fn move_visual_to_file_edge(&mut self, last: bool) {
+        let Some(visual) = self.visual.clone() else {
+            return;
+        };
+        let rows = self.diff_rows();
+        let mut edge = None;
+        for (index, row) in rows.iter().enumerate() {
+            if self.row_visual_line(Some(*row), &visual).is_some() {
+                edge = Some(index);
+                if !last {
+                    break;
+                }
+            }
+        }
+        if let Some(index) = edge {
+            self.select_diff(index);
+        }
+    }
+
+    pub(super) fn visual_covers_index(&self, index: usize) -> bool {
+        let Some(visual) = self.visual.as_ref() else {
+            return false;
+        };
+        let Some(row) = self.diff_rows().get(index).copied() else {
+            return false;
+        };
+        self.row_visual_line(Some(row), visual).is_some_and(|line| {
+            self.visual_line_span(visual)
+                .is_some_and(|(start, end)| (start..=end).contains(&line))
+        })
+    }
+
+    pub(super) fn visual_covers_anchor(&self, anchor: Option<&LineAnchor>) -> bool {
+        let Some(visual) = self.visual.as_ref() else {
+            return false;
+        };
+        let Some(anchor) = anchor else {
+            return false;
+        };
+        if anchor.path != visual.path || anchor.side != visual.side {
+            return false;
+        }
+        self.visual_line_span(visual)
+            .is_some_and(|(start, end)| (start..=end).contains(&anchor.line))
+    }
+
+    pub(super) fn visual_location(&self) -> Option<String> {
+        let visual = self.visual.as_ref()?;
+        let (start, end) = self.visual_line_span(visual)?;
+        let location = if start == end {
+            format!("{}:{start}", visual.path)
+        } else {
+            format!("{}:{start}-{end}", visual.path)
+        };
+        Some(format!("{location} [{}]", visual.side.as_str()))
+    }
+
+    fn comment_range(&self) -> Option<(LineAnchor, u32)> {
+        if let Some(visual) = &self.visual {
+            let (start, end) = self.visual_line_span(visual)?;
+            Some((
+                LineAnchor {
+                    path: visual.path.clone(),
+                    line: start,
+                    side: visual.side,
+                },
+                end,
+            ))
+        } else {
+            let anchor = self.selected_anchor()?.clone();
+            let line = anchor.line;
+            Some((anchor, line))
+        }
+    }
+
+    fn move_visual(&mut self, down: bool) {
+        let Some(visual) = self.visual.clone() else {
+            return;
+        };
+        let rows = self.diff_rows();
+        let mut index = self.selected_diff;
+        loop {
+            if down {
+                if index + 1 >= rows.len() {
+                    return;
+                }
+                index += 1;
+            } else if index == 0 {
+                return;
+            } else {
+                index -= 1;
+            }
+            match rows.get(index) {
+                Some(DiffRow::File(_)) => return,
+                Some(row) if self.row_visual_line(Some(*row), &visual).is_some() => {
+                    self.select_diff(index);
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    }
+
+    fn visual_line_span(&self, visual: &super::VisualRange) -> Option<(u32, u32)> {
+        let rows = self.diff_rows();
+        let lo = visual.origin.min(self.selected_diff);
+        let hi = visual.origin.max(self.selected_diff);
+        let mut start = None;
+        let mut end = None;
+        for row in rows.get(lo..=hi)? {
+            if let Some(line) = self.row_visual_line(Some(*row), visual) {
+                start = Some(start.map_or(line, |current: u32| current.min(line)));
+                end = Some(end.map_or(line, |current: u32| current.max(line)));
+            }
+        }
+        Some((start?, end?))
+    }
+
+    fn row_visual_line(&self, row: Option<DiffRow>, visual: &super::VisualRange) -> Option<u32> {
+        let line = match row? {
+            DiffRow::File(_) => return None,
+            DiffRow::Line { file, line } if file == visual.file => {
+                self.diff.files[file].lines[line].anchor_on(visual.side)
+            }
+            DiffRow::SideBySide { file, row } if file == visual.file => {
+                let line = match visual.side {
+                    Side::Old => row.old_line(),
+                    Side::New => row.new_line(),
+                }?;
+                self.diff.files[file].lines[line].anchor_on(visual.side)
+            }
+            DiffRow::Line { .. } | DiffRow::SideBySide { .. } => return None,
+        }?;
+        Some(line.line)
+    }
+}
+
+fn comment_ends_on_anchor(comment: &Comment, anchor: &LineAnchor) -> bool {
+    comment.covers(&anchor.path, anchor.line, anchor.side) && comment.end_line() == anchor.line
 }

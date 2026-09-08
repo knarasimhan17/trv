@@ -118,8 +118,11 @@ fn main_cell(
     let cursor = if active { "▌" } else { " " };
     let text = format!("{cursor}{marker} {line_number:>5} {prefix}{}", line.text);
     let mut style = line_style(line.kind);
+    if active || app.visual_covers_anchor(line.anchor_on(side)) {
+        style = style.bg(Color::DarkGray);
+    }
     if active {
-        style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        style = style.add_modifier(Modifier::BOLD);
     }
     Span::styled(fit_width(&text, width), style)
 }
@@ -139,7 +142,7 @@ fn comment_rows(
         .saturating_sub(UnicodeWidthStr::width(COMMENT_PREFIX))
         .max(1);
 
-    app.comments_for_anchor(anchor)
+    app.comments_ending_on_anchor(anchor)
         .flat_map(|comment| wrap_comment_body(&comment.body, body_width))
         .map(|body| format!("{COMMENT_PREFIX}{body}"))
         .collect()
