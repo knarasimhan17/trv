@@ -48,6 +48,7 @@ enum Mode {
     Comments,
     CommentInput {
         anchor: LineAnchor,
+        end_line: u32,
         body: String,
         existing: Option<usize>,
     },
@@ -84,6 +85,7 @@ struct App {
     selected_comment: usize,
     diff_layout: DiffLayout,
     inline_comments: bool,
+    visual: Option<VisualRange>,
     mode: Mode,
     status: Option<String>,
     help: bool,
@@ -97,6 +99,14 @@ struct DiffListLayout {
     offset: usize,
     heights: Vec<u16>,
     line_width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisualRange {
+    origin: usize,
+    file: usize,
+    side: Side,
+    path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +137,7 @@ impl App {
             selected_comment: 0,
             diff_layout: DiffLayout::Unified,
             inline_comments: true,
+            visual: None,
             mode: Mode::Diff,
             status: None,
             help: false,
@@ -190,6 +201,7 @@ impl App {
         self.selected_side = Side::New;
         self.selected_comment = 0;
         self.diff_list = DiffListLayout::default();
+        self.visual = None;
         self.mode = Mode::Diff;
         self.rev_picker = None;
     }
@@ -367,21 +379,54 @@ impl App {
         let context = self.review_context();
         let action = bindings::action_for(bindings::review_bindings(context), &key)?;
         match action {
-            bindings::ReviewAction::MoveDown => self.move_diff_down(),
-            bindings::ReviewAction::MoveUp => self.move_diff_up(),
-            bindings::ReviewAction::First => self.select_diff(0),
-            bindings::ReviewAction::Last => {
-                self.select_diff(self.diff_rows().len().saturating_sub(1));
+            bindings::ReviewAction::MoveDown => self.move_visual_or_diff(true),
+            bindings::ReviewAction::MoveUp => self.move_visual_or_diff(false),
+            bindings::ReviewAction::First => {
+                if self.visual.is_some() {
+                    self.move_visual_to_file_edge(false);
+                } else {
+                    self.select_diff(0);
+                }
             }
-            bindings::ReviewAction::NextFile => self.next_file(),
-            bindings::ReviewAction::PreviousFile => self.previous_file(),
-            bindings::ReviewAction::SelectOld => self.select_side(Side::Old),
-            bindings::ReviewAction::SelectNew => self.select_side(Side::New),
+            bindings::ReviewAction::Last => {
+                if self.visual.is_some() {
+                    self.move_visual_to_file_edge(true);
+                } else {
+                    self.select_diff(self.diff_rows().len().saturating_sub(1));
+                }
+            }
+            bindings::ReviewAction::NextFile => {
+                if self.visual.is_none() {
+                    self.next_file();
+                }
+            }
+            bindings::ReviewAction::PreviousFile => {
+                if self.visual.is_none() {
+                    self.previous_file();
+                }
+            }
+            bindings::ReviewAction::SelectOld => {
+                if self.visual.is_none() {
+                    self.select_side(Side::Old);
+                }
+            }
+            bindings::ReviewAction::SelectNew => {
+                if self.visual.is_none() {
+                    self.select_side(Side::New);
+                }
+            }
             bindings::ReviewAction::ToggleFile => {
-                self.toggle_selected_file();
+                if self.visual.is_some() {
+                    self.start_comment();
+                } else {
+                    self.toggle_selected_file();
+                }
             }
             bindings::ReviewAction::ToggleFileOrComments => {
-                if !self.toggle_selected_file() {
+                if self.visual.is_some() {
+                    self.start_comment();
+                } else if !self.toggle_selected_file() {
+                    self.visual = None;
                     self.mode = Mode::Comments;
                 }
             }
@@ -389,8 +434,15 @@ impl App {
             bindings::ReviewAction::EditComment => self.edit_selected_comment(),
             bindings::ReviewAction::DeleteComment => self.delete_selected_line_comment(),
             bindings::ReviewAction::OpenRevisions => self.open_rev_picker(),
-            bindings::ReviewAction::OpenComments => self.mode = Mode::Comments,
-            bindings::ReviewAction::ToggleLayout => self.toggle_diff_layout(),
+            bindings::ReviewAction::OpenComments => {
+                self.visual = None;
+                self.mode = Mode::Comments;
+            }
+            bindings::ReviewAction::StartVisual => self.toggle_visual(),
+            bindings::ReviewAction::ToggleLayout => {
+                self.visual = None;
+                self.toggle_diff_layout();
+            }
             bindings::ReviewAction::ToggleInlineComments => {
                 self.inline_comments = !self.inline_comments;
                 let state = if self.inline_comments {
@@ -401,6 +453,11 @@ impl App {
                 self.status = Some(format!("Inline comments {state}."));
             }
             bindings::ReviewAction::Export => return self.export_comments(),
+            bindings::ReviewAction::Cancel => {
+                if !self.cancel_visual() {
+                    return self.request_quit();
+                }
+            }
             bindings::ReviewAction::Quit => return self.request_quit(),
             bindings::ReviewAction::Help => self.help = true,
             bindings::ReviewAction::ReturnToDiff => {
@@ -450,8 +507,10 @@ impl App {
             | bindings::ReviewAction::ToggleFileOrComments
             | bindings::ReviewAction::AddComment
             | bindings::ReviewAction::OpenComments
+            | bindings::ReviewAction::StartVisual
             | bindings::ReviewAction::ToggleInlineComments
-            | bindings::ReviewAction::ToggleLayout => {
+            | bindings::ReviewAction::ToggleLayout
+            | bindings::ReviewAction::Cancel => {
                 unreachable!("comment-list keymap cannot contain diff actions")
             }
         }
@@ -483,6 +542,7 @@ impl App {
                 let mode = std::mem::replace(&mut self.mode, Mode::Diff);
                 let Mode::CommentInput {
                     anchor,
+                    end_line,
                     body,
                     existing,
                 } = mode
@@ -503,9 +563,10 @@ impl App {
                         self.status = Some("Empty comment ignored.".to_owned());
                     }
                     None => {
-                        self.comments.push(Comment::open(
+                        self.comments.push(Comment::range(
                             anchor.path,
                             anchor.line,
+                            end_line,
                             anchor.side,
                             body,
                         ));
@@ -679,9 +740,8 @@ fn render_comments(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .iter()
             .map(|comment| {
                 ListItem::new(format!(
-                    "{}:{} [{}] {}",
-                    comment.path,
-                    comment.line,
+                    "{} [{}] {}",
+                    comment.location(),
                     comment.side.as_str(),
                     comment.body
                 ))
@@ -712,7 +772,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn footer_text(app: &App) -> String {
     let detail = app.status.clone().unwrap_or_else(|| {
-        if app.visible_view() == View::Diff {
+        if let Some(label) = app.visual_location() {
+            format!("visual {label} | c comment | Esc cancel")
+        } else if app.visible_view() == View::Diff {
             app.selected_anchor()
                 .map(|anchor| format!("{}:{} [{}]", anchor.path, anchor.line, anchor.side.as_str()))
                 .unwrap_or_default()
@@ -730,9 +792,16 @@ fn footer_text(app: &App) -> String {
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT
                 )
+            } else if app.visual.is_some() {
+                format!(
+                    "r revs | {} | s view: {} | {}",
+                    app.view_label(),
+                    app.diff_layout.as_str(),
+                    bindings::HELP_HINT
+                )
             } else {
                 format!(
-                    "r revs | {} | s view: {} | v inline comments: {inline_state} | {}",
+                    "r revs | {} | s view: {} | i inline comments: {inline_state} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT

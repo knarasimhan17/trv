@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +192,11 @@ fn validate_revision(revision: &Revision) -> Result<()> {
         }
         if comment.line == 0 {
             bail!("comment line must be greater than zero");
+        }
+        if let Some(end_line) = comment.end_line {
+            if end_line <= comment.line {
+                bail!("comment end line must be greater than the start line");
+            }
         }
         if comment.body.trim().is_empty() {
             bail!("comment body must not be empty");

@@ -40,6 +40,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> Option
                     app,
                     &app.diff.files[file].lines[line],
                     line_width,
+                    app.visual_covers_index(index),
                 )),
                 DiffRow::SideBySide { file, row } => ListItem::new(side_by_side::item_lines(
                     app,
@@ -283,9 +284,10 @@ fn file_header(file: &DiffFile, width: usize, collapsed: bool) -> Line<'static> 
     ])
 }
 
-fn item_lines(app: &App, line: &DiffLine, width: usize) -> Vec<Line<'static>> {
-    let comments = app.comments_for_line(line).collect::<Vec<_>>();
-    let marker = if comments.is_empty() { " " } else { "●" };
+fn item_lines(app: &App, line: &DiffLine, width: usize, in_visual: bool) -> Vec<Line<'static>> {
+    let covering = app.comments_for_line(line).collect::<Vec<_>>();
+    let comments = app.comments_ending_on_line(line).collect::<Vec<_>>();
+    let marker = if covering.is_empty() { " " } else { "●" };
     let old_line = line
         .old_line
         .map(|line| line.to_string())
@@ -295,9 +297,13 @@ fn item_lines(app: &App, line: &DiffLine, width: usize) -> Vec<Line<'static>> {
         .map(|line| line.to_string())
         .unwrap_or_default();
     let gutter = format!("{marker} {old_line:>5} {new_line:>5} ");
+    let mut style = line_style(line.kind);
+    if in_visual {
+        style = style.bg(Color::DarkGray);
+    }
     let mut rows = vec![Line::from(vec![
         Span::styled(gutter, Style::default().fg(Color::DarkGray)),
-        Span::styled(display_text(line), line_style(line.kind)),
+        Span::styled(display_text(line), style),
     ])];
 
     if app.inline_comments {
@@ -422,10 +428,15 @@ diff --git a/src/lib.rs b/src/lib.rs
         body.push_str("first exceptionallylong\n\nnext");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        let visible = item_lines(&app, &app.diff.files[0].lines[selected], NARROW_WIDTH)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let visible = item_lines(
+            &app,
+            &app.diff.files[0].lines[selected],
+            NARROW_WIDTH,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
         assert_eq!(
             visible,
             [
@@ -445,14 +456,77 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
 
         app.inline_comments = false;
-        let hidden = item_lines(&app, &app.diff.files[0].lines[selected], NARROW_WIDTH)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let hidden = item_lines(
+            &app,
+            &app.diff.files[0].lines[selected],
+            NARROW_WIDTH,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
         assert_eq!(
             hidden,
             ["●           1 +new"],
             "hiding inline bodies must retain the gutter marker"
+        );
+    }
+
+    #[test]
+    fn range_comments_mark_every_covered_line_and_show_the_body_on_the_last() {
+        let mut app = App::new(ParsedDiff::parse(
+            "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+ first
+-old
++second
+",
+        ));
+
+        let first = app.diff.files[0]
+            .lines
+            .iter()
+            .position(|line| line.text == "first")
+            .expect("fixture must contain the first context line");
+        let second = app.diff.files[0]
+            .lines
+            .iter()
+            .position(|line| line.text == "second")
+            .expect("fixture must contain the added line");
+        let path = app.diff.files[0].lines[first]
+            .anchor_on(crate::model::Side::New)
+            .expect("the context line must have a new-side anchor")
+            .path
+            .clone();
+        app.comments.push(crate::model::Comment::range(
+            path,
+            1,
+            2,
+            crate::model::Side::New,
+            "extract both lines".to_owned(),
+        ));
+
+        let start_rows = item_lines(&app, &app.diff.files[0].lines[first], NARROW_WIDTH, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let end_rows = item_lines(&app, &app.diff.files[0].lines[second], NARROW_WIDTH, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            start_rows,
+            ["●     1     1  first"],
+            "covered lines before the end of a range must keep a marker without repeating the body"
+        );
+        assert_eq!(
+            end_rows,
+            ["●           2 +second", "┃ extract", "┃ both lines"],
+            "the last line of a range must show the wrapped comment body"
         );
     }
 

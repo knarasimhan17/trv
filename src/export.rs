@@ -2,16 +2,16 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
-use base64::engine::general_purpose::STANDARD;
+use anyhow::{Context, Result, bail};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 use crate::model::Comment;
 
 pub(crate) fn format_comments(comments: &[Comment]) -> String {
     comments
         .iter()
-        .map(|comment| format!("{}:{}: {}", comment.path, comment.line, comment.body))
+        .map(|comment| format!("{}: {}", comment.location(), comment.body))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -76,33 +76,48 @@ fn write_to_command(program: &str, args: &[&str], text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Comment, CommentState, Side};
+    use crate::model::{Comment, Side};
 
     use super::format_comments;
 
     #[test]
     fn export_separates_comment_blocks_and_preserves_anchors() {
         let comments = vec![
-            Comment {
-                path: "src/lib.rs".to_owned(),
-                line: 12,
-                side: Side::New,
-                body: "Return the original error.".to_owned(),
-                state: CommentState::Open,
-            },
-            Comment {
-                path: "src/main.rs".to_owned(),
-                line: 4,
-                side: Side::Old,
-                body: "Keep this validation.".to_owned(),
-                state: CommentState::Open,
-            },
+            Comment::open(
+                "src/lib.rs".to_owned(),
+                12,
+                Side::New,
+                "Return the original error.".to_owned(),
+            ),
+            Comment::open(
+                "src/main.rs".to_owned(),
+                4,
+                Side::Old,
+                "Keep this validation.".to_owned(),
+            ),
         ];
 
         assert_eq!(
             format_comments(&comments),
             "src/lib.rs:12: Return the original error.\n\nsrc/main.rs:4: Keep this validation.",
             "exports must contain blank-line-separated path and line anchors"
+        );
+    }
+
+    #[test]
+    fn export_formats_range_comments_as_start_end_spans() {
+        let comments = vec![Comment::range(
+            "src/lib.rs".to_owned(),
+            12,
+            18,
+            Side::New,
+            "Extract this block.".to_owned(),
+        )];
+
+        assert_eq!(
+            format_comments(&comments),
+            "src/lib.rs:12-18: Extract this block.",
+            "range exports must keep a path:start-end: body shape agents can parse"
         );
     }
 }

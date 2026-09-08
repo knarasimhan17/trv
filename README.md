@@ -78,7 +78,7 @@ a manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)
-# REVIEW is `path:line: body` blocks, or empty if you quit with no comments
+# REVIEW is `path:line: body` or `path:start-end: body` blocks, or empty if you quit with no comments
 ```
 
 The footer shows `q send comments` so it is obvious that quit returns the
@@ -96,12 +96,14 @@ expand it.
 Inside a review, use `j`/`k` or the up/down arrows to move between lines, or
 click a line with the mouse. The scroll wheel also moves the selection. Use
 `]`/`[` to move between files, `g`/`G` to jump to the first or last line, `c`
-to add a comment, or click an added or deleted line to comment on that side.
-Click an existing comment to edit it, `d` to delete the
-comment on the selected line, `l` to view comments, `r` to switch between the
+to add a comment, `v`/`V` to select a multi-line range and then `c` or `Enter`
+to comment on it, or click an added or deleted line to comment on that side.
+`Esc` or `v` cancels an in-progress range. Click an existing comment to edit it,
+`d` to delete the comment on the selected line (including any range that covers
+it), `l` to view comments, `r` to switch between the
 current review, the interdiff since the last revision (also commentable), and
 frozen revisions,
-`s` to toggle unified or side-by-side layout, `v` to show or hide inline
+`s` to toggle unified or side-by-side layout, `i` to show or hide inline
 comment rows, `y` to export, `?` to show context-aware help, and `q` to quit
 (`q` sends comments in `--agent` mode). While editing, `Enter` saves,
 `Esc` cancels, and `Ctrl-D` or an empty `Enter` deletes the comment. In the

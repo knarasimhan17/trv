@@ -115,7 +115,7 @@ diff --git file.rs file.rs
 
     assert!(app.inline_comments, "inline comments must start visible");
     assert!(
-        footer_text(&app).contains("v inline comments: on"),
+        footer_text(&app).contains("i inline comments: on"),
         "the footer must document the toggle and its state"
     );
     assert!(
@@ -123,9 +123,9 @@ diff --git file.rs file.rs
         "the review footer must make help discoverable"
     );
 
-    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
 
-    assert!(!app.inline_comments, "v must hide inline comment bodies");
+    assert!(!app.inline_comments, "i must hide inline comment bodies");
     assert_eq!(
         app.selected_diff, selected,
         "toggling inline comments must preserve the selected diff line"
@@ -1145,7 +1145,7 @@ fn agent_quit_submits_comments_without_a_confirm_prompt() {
         "agent mode must tell the user that quit sends comments"
     );
     assert!(
-        !footer_text(&app).contains("v inline comments"),
+        !footer_text(&app).contains("i inline comments"),
         "agent footer should prioritize sending comments over extra toggles"
     );
 
@@ -1179,6 +1179,207 @@ fn agent_quit_with_no_comments_still_unblocks_the_agent() {
     assert!(
         comments.is_empty(),
         "accepting the diff must send an empty comment list, not a discard"
+    );
+}
+
+const RANGE_DIFF: &str = "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,4 +1,4 @@
+ alpha
+ beta
+ gamma
+-old
++delta
+";
+
+fn row_with_text(app: &App, text: &str) -> usize {
+    app.diff_rows()
+        .iter()
+        .position(|row| match row {
+            DiffRow::Line { file, line } => app.diff.files[*file].lines[*line].text == text,
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("fixture must contain {text:?}"))
+}
+
+fn save_open_comment(app: &mut App, body: &str) {
+    let Mode::CommentInput { body: input, .. } = &mut app.mode else {
+        panic!("comment input must be open");
+    };
+    input.push_str(body);
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[test]
+fn visual_range_comments_cover_every_selected_line() {
+    let mut app = App::new(ParsedDiff::parse(RANGE_DIFF));
+    app.select_diff(row_with_text(&app, "alpha"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    assert!(
+        app.visual.is_some(),
+        "v must start a visual range on a commentable line"
+    );
+    assert!(
+        footer_text(&app).contains("visual file.rs:1 [new]"),
+        "the footer must show the in-progress range: {}",
+        footer_text(&app)
+    );
+
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_anchor().map(|anchor| anchor.line),
+        Some(4),
+        "j in visual mode must extend onto later lines of the same side"
+    );
+
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    save_open_comment(&mut app, "extract this block");
+
+    assert!(
+        app.visual.is_none(),
+        "saving a range comment must leave visual mode"
+    );
+    assert_eq!(app.comments.len(), 1);
+    assert_eq!(app.comments[0].start_line(), 1);
+    assert_eq!(app.comments[0].end_line(), 4);
+    assert_eq!(app.comments[0].side, Side::New);
+    assert_eq!(app.comments[0].location(), "file.rs:1-4");
+    assert!(
+        app.comments[0].covers("file.rs", 2, Side::New)
+            && app.comments[0].covers("file.rs", 4, Side::New),
+        "the saved comment must cover every line in the visual span"
+    );
+}
+
+#[test]
+fn capital_v_also_starts_visual_mode() {
+    let mut app = App::new(ParsedDiff::parse(RANGE_DIFF));
+    app.select_diff(row_with_text(&app, "beta"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
+    assert!(app.visual.is_some(), "V must start a visual range");
+}
+
+#[test]
+fn esc_cancels_a_visual_range_instead_of_quitting() {
+    let mut app = App::new(ParsedDiff::parse(RANGE_DIFF));
+    app.select_diff(row_with_text(&app, "alpha"));
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let outcome = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(
+        outcome.is_none(),
+        "Esc during a range must not quit the review"
+    );
+    assert!(
+        app.visual.is_none(),
+        "Esc must cancel the in-progress range"
+    );
+    assert!(
+        app.status.as_deref() == Some("Range canceled."),
+        "canceling a range must tell the user: {:?}",
+        app.status
+    );
+}
+
+#[test]
+fn visual_range_cannot_leave_the_current_file() {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git first.rs first.rs
+--- first.rs
++++ first.rs
+@@ -1,2 +1,2 @@
+ one
+-old
++new
+diff --git second.rs second.rs
+--- second.rs
++++ second.rs
+@@ -1 +1 @@
+-before
++after
+",
+    ));
+    app.select_diff(row_with_text(&app, "one"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    for _ in 0..8 {
+        app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.path.as_str(), anchor.line)),
+        Some(("first.rs", 2)),
+        "visual movement must stop at the last commentable line of the current file"
+    );
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_anchor().map(|anchor| anchor.path.as_str()),
+        Some("first.rs"),
+        "next-file must not break an in-progress range"
+    );
+}
+
+#[test]
+fn deleting_from_any_line_in_a_range_removes_the_comment() {
+    let mut app = App::new(ParsedDiff::parse(RANGE_DIFF));
+    app.select_diff(row_with_text(&app, "alpha"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    save_open_comment(&mut app, "too broad");
+
+    app.select_diff(row_with_text(&app, "beta"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    assert!(
+        app.comments.is_empty(),
+        "d on a line covered by a range comment must delete that comment"
+    );
+}
+
+#[test]
+fn enter_in_visual_mode_opens_a_range_comment() {
+    let mut app = App::new(ParsedDiff::parse(RANGE_DIFF));
+    app.select_diff(row_with_text(&app, "alpha"));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let Mode::CommentInput {
+        anchor, end_line, ..
+    } = &app.mode
+    else {
+        panic!("Enter in visual mode must open a comment for the selected range");
+    };
+    assert_eq!(anchor.line, 1);
+    assert_eq!(*end_line, 2);
+}
+
+#[test]
+fn frozen_revisions_reject_visual_ranges() {
+    let mut app = App::from_session(two_round_session());
+    app.viewing = ViewKind::Frozen(1);
+    app.load_view();
+    let addition = app
+        .diff_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                DiffRow::Line { file: 0, line } if app.diff.files[0].lines[*line].anchor().is_some()
+            )
+        })
+        .expect("frozen fixture must have a commentable line");
+    app.select_diff(addition);
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    assert!(
+        app.visual.is_none(),
+        "frozen revisions must not start a commentable range"
     );
 }
 
