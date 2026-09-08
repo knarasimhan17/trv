@@ -167,8 +167,8 @@ impl App {
                     .and_then(|(previous, diff)| (*previous == rev).then_some(diff.clone()))
                     .expect("interdiff view requires the previous revision diff");
                 self.diff = diff;
-                self.comments = Vec::new();
-                self.read_only = true;
+                self.comments = live.comments.clone();
+                self.read_only = false;
             }
             ViewKind::Frozen(rev) => {
                 let frozen = self
@@ -201,8 +201,8 @@ impl App {
 
     fn pending_comments(&self) -> usize {
         match self.viewing {
-            ViewKind::LiveMain => self.comments.len(),
-            _ => self
+            ViewKind::LiveMain | ViewKind::LiveSince(_) => self.comments.len(),
+            ViewKind::Frozen(_) => self
                 .session
                 .live
                 .as_ref()

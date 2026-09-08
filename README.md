@@ -18,8 +18,9 @@ rev; the next time you review, that latest tree becomes the next round.
 
 Creating rev-2 never changes rev-1. The default view is the current tree with
 a clean comment set. Press `r` to open a saved revision (with its comments) or
-to compare the current tree against the last review. New comments attach only
-to the current round.
+to compare the current tree against the last review. Comments on the current
+vs mainline view and on the interdiff both belong to the current round. Frozen
+revisions stay read-only.
 
 ## Install
 
@@ -75,7 +76,8 @@ click a line with the mouse. The scroll wheel also moves the selection. Use
 `]`/`[` to move between files, `g`/`G` to jump to the first or last line, `c`
 to add a comment, click an existing comment to edit it, `d` to delete the
 comment on the selected line, `l` to view comments, `r` to switch between the
-current review, the interdiff since the last revision, and frozen revisions,
+current review, the interdiff since the last revision (also commentable), and
+frozen revisions,
 `s` to toggle unified or side-by-side layout, `v` to show or hide inline
 comment rows, `y` to export, `?` to show context-aware help, and `q` to quit. While editing, `Enter` saves,
 `Esc` cancels, and `Ctrl-D` or an empty `Enter` deletes the comment. In the

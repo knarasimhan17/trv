@@ -892,14 +892,13 @@ fn switching_back_to_current_does_not_keep_frozen_comments() {
 }
 
 #[test]
-fn interdiff_view_is_read_only_and_hides_comments() {
+fn interdiff_view_accepts_comments_on_the_current_round() {
     let mut app = App::from_session(two_round_session());
     app.viewing = ViewKind::LiveSince(1);
     app.load_view();
-    assert!(app.read_only);
     assert!(
-        app.comments.is_empty(),
-        "the since-last-rev view must stay clean"
+        !app.read_only,
+        "the since-last-rev view must accept comments for the current round"
     );
     assert!(
         app.diff.files[0]
@@ -908,6 +907,36 @@ fn interdiff_view_is_read_only_and_hides_comments() {
             .any(|line| line.text == "live"),
         "the interdiff must show the current tree against rev-1"
     );
+
+    let addition = app
+        .diff_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                DiffRow::Line { file: 0, line } if app.diff.files[0].lines[*line].text == "live"
+            )
+        })
+        .expect("the interdiff must contain the current-tree line");
+    app.select_diff(addition);
+    app.start_comment();
+    let Mode::CommentInput { body, .. } = &mut app.mode else {
+        panic!("commenting on the interdiff must open the input");
+    };
+    body.push_str("since last rev");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    app.viewing = ViewKind::LiveMain;
+    app.load_view();
+    assert_eq!(
+        app.comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>(),
+        ["since last rev"],
+        "interdiff comments must stay on the current round"
+    );
+    assert!(!app.read_only);
 }
 
 #[test]
