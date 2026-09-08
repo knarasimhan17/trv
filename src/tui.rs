@@ -196,7 +196,10 @@ impl App {
 
     fn view_label(&self) -> String {
         match self.viewing {
-            ViewKind::LiveMain => format!("rev-{} draft", self.session.next_rev()),
+            ViewKind::LiveMain => format!(
+                "current vs mainline (rev-{} draft)",
+                self.session.next_rev()
+            ),
             ViewKind::LiveSince(rev) => format!("current vs rev-{rev}"),
             ViewKind::Frozen(rev) => format!("rev-{rev}"),
         }
