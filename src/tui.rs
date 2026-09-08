@@ -563,13 +563,11 @@ impl App {
                         self.status = Some("Empty comment ignored.".to_owned());
                     }
                     None => {
-                        self.comments.push(Comment::range(
-                            anchor.path,
-                            anchor.line,
-                            end_line,
-                            anchor.side,
-                            body,
-                        ));
+                        self.comments.push(if end_line == anchor.line {
+                            Comment::open(anchor.path, anchor.line, anchor.side, body)
+                        } else {
+                            Comment::range(anchor.path, anchor.line, end_line, anchor.side, body)
+                        });
                         self.selected_comment = self.comments.len().saturating_sub(1);
                         self.status = Some("Comment added.".to_owned());
                     }
