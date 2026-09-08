@@ -38,10 +38,7 @@ impl Drop for HostPause {
 
 pub(crate) fn session_tty() -> Result<File> {
     ignore_background_tty_signals();
-    if term_is_unusable() {
-        // SAFETY: trv is single-threaded during terminal attach.
-        unsafe { env::set_var("TERM", "xterm-256color") };
-    }
+    prepare_color_env();
     let path = session_tty_path()?;
     let file = OpenOptions::new()
         .read(true)
@@ -219,10 +216,14 @@ fn ignore_background_tty_signals() {
     }
 }
 
-fn term_is_unusable() -> bool {
-    match env::var("TERM") {
-        Ok(term) => term.is_empty() || term == "dumb",
-        Err(_) => true,
+fn prepare_color_env() {
+    // Agent runners often set TERM=dumb and omit COLORTERM because they
+    // capture a pipe, not a TUI. The review still draws on the session tty.
+    // SAFETY: trv is single-threaded during terminal attach.
+    unsafe {
+        env::set_var("TERM", "xterm-256color");
+        env::set_var("COLORTERM", "truecolor");
+        env::remove_var("NO_COLOR");
     }
 }
 
