@@ -1,4 +1,4 @@
-use crate::diff::{DiffLine, LineAnchor, SideBySideRow};
+use crate::diff::{DiffLine, DiffLineKind, LineAnchor, SideBySideRow};
 use crate::model::{Comment, Side};
 
 use super::{App, DiffLayout, DiffRow, Mode, ReviewOutcome, View};
@@ -45,6 +45,8 @@ impl App {
         }
         if let Some(comment) = super::diff_view::comment_index_at(self, column, row) {
             self.edit_comment(comment);
+        } else if self.selected_line_is_change() {
+            self.start_comment();
         }
     }
 
@@ -237,6 +239,23 @@ impl App {
             Mode::Comments => View::Comments,
             Mode::QuitConfirm { previous } => previous,
         }
+    }
+
+    fn selected_line_is_change(&self) -> bool {
+        let Some(row) = self.selected_row() else {
+            return false;
+        };
+        let kind = match row {
+            DiffRow::Line { file, line } => self.diff.files[file].lines[line].kind,
+            DiffRow::SideBySide { file, row } => {
+                let Some((line, _)) = self.line_on_selected_side(row) else {
+                    return false;
+                };
+                self.diff.files[file].lines[line].kind
+            }
+            DiffRow::File(_) => return false,
+        };
+        matches!(kind, DiffLineKind::Addition | DiffLineKind::Deletion)
     }
 
     pub(super) fn selected_anchor(&self) -> Option<&LineAnchor> {

@@ -3,7 +3,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
-use crate::diff::ParsedDiff;
+use crate::diff::{ParsedDiff, SideBySideRow};
 use crate::model::{Comment, Side};
 use crate::session::{FrozenReview, LiveReview, ReviewSession, ViewKind};
 
@@ -442,6 +442,159 @@ diff --git file.rs file.rs
         "clicking a diff line must select it for commenting, got {:?} from {rows:?}",
         app.selected_row()
     );
+    assert!(
+        matches!(app.mode, Mode::CommentInput { .. }),
+        "clicking an added or deleted line must open the comment box"
+    );
+}
+
+#[test]
+fn side_by_side_deletion_rows_accept_comments() {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,4 +1,3 @@
+ keep
+-removed_fn
+-also_gone
+ still
+",
+    ));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    let removed = app
+        .diff_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                DiffRow::SideBySide { file: 0, row: SideBySideRow::Old(line) }
+                    if app.diff.files[0].lines[*line].text == "removed_fn"
+            )
+        })
+        .expect("the deleted line must have its own old-side row");
+    app.select_diff(removed);
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.line, anchor.side)),
+        Some((2, Side::Old)),
+        "landing on a deleted line must select the old column"
+    );
+    app.start_comment();
+    let Mode::CommentInput {
+        body, existing: _, ..
+    } = &mut app.mode
+    else {
+        panic!(
+            "commenting on a deleted side-by-side line must open the input, selected {:?}",
+            app.selected_anchor()
+        );
+    };
+    body.push_str("why remove this?");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.comments
+            .iter()
+            .map(|comment| (comment.line, comment.side, comment.body.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, Side::Old, "why remove this?")],
+        "deleted lines must keep old-side comment anchors"
+    );
+}
+
+#[test]
+fn side_by_side_click_comments_on_a_deleted_line() {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,3 +1,3 @@
+ keep
+-removed_fn
++added_fn
+ still
+",
+    ));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    let mut terminal = Terminal::new(TestBackend::new(72, 16)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("review must render");
+    let rows = buffer_rows(terminal.backend().buffer());
+    let line_y = rows
+        .iter()
+        .position(|row| row.contains("removed_fn"))
+        .expect("the deleted line must be visible") as u16;
+    let old_x = rows[line_y as usize]
+        .find("removed_fn")
+        .expect("the deleted text must be on screen") as u16;
+
+    app.handle_mouse(click(old_x, line_y));
+    let Mode::CommentInput { body, .. } = &mut app.mode else {
+        panic!(
+            "clicking a deleted line must open a comment on the old side, selected {:?} from {rows:?}",
+            app.selected_anchor()
+        );
+    };
+    body.push_str("keep this method");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.comments
+            .iter()
+            .map(|comment| (comment.side, comment.body.as_str()))
+            .collect::<Vec<_>>(),
+        [(Side::Old, "keep this method")],
+        "a click on the red column must comment on the deleted line, not the replacement"
+    );
+}
+
+#[test]
+fn side_by_side_left_key_comments_on_a_paired_deletion() {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,3 +1,3 @@
+ keep
+-removed_fn
++added_fn
+ still
+",
+    ));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    let paired = app
+        .diff_rows()
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                DiffRow::SideBySide {
+                    file: 0,
+                    row: SideBySideRow::Paired { old, new }
+                } if app.diff.files[0].lines[*old].text == "removed_fn"
+                    && app.diff.files[0].lines[*new].text == "added_fn"
+            )
+        })
+        .expect("the replacement must share one side-by-side row");
+    app.select_diff(paired);
+    app.handle_diff_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.start_comment();
+    let Mode::CommentInput { body, .. } = &mut app.mode else {
+        panic!(
+            "Left then c must comment on the deleted side of a replacement, selected {:?}",
+            app.selected_anchor()
+        );
+    };
+    body.push_str("why delete this?");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.comments[0].side,
+        Side::Old,
+        "the left column of a replacement row is the deleted line"
+    );
 }
 
 #[test]
@@ -746,9 +899,12 @@ diff --git file.rs file.rs
         .expect("the added line must be visible") as u16;
 
     app.handle_mouse(click(8, line_y));
-    assert!(
-        matches!(app.mode, Mode::Diff),
-        "clicking the code row must select it without opening the editor"
+    let Mode::CommentInput { existing, .. } = &app.mode else {
+        panic!("clicking an added or deleted code row must open a new comment");
+    };
+    assert_eq!(
+        *existing, None,
+        "clicking the code row must not edit the existing inline comment"
     );
 }
 
