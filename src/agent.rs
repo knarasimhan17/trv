@@ -96,13 +96,13 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
         in_warp(),
     ) {
         Launch::Tmux => spawn_tmux(&cwd, &script)?,
-        Launch::Warp => spawn_warp_split(&script)?,
+        Launch::Warp => spawn_warp_tab(&script)?,
         Launch::Here => bail!(
             "trv --agent needs a pane in this window (Warp or tmux). Run it from a tty, inside tmux, or inside Warp."
         ),
     }
 
-    eprintln!("trv: waiting for you to finish the review in the split pane");
+    eprintln!("trv: review opened; waiting until you quit");
     let status = wait_for_done(&done)?;
     let status = status.trim();
     if status != "ok" {
@@ -160,17 +160,6 @@ fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
     }
 }
 
-fn spawn_warp_split(script: &Path) -> Result<()> {
-    let keystroke = Command::new("osascript")
-        .arg("-e")
-        .arg(warp_split_script(script))
-        .status();
-    if keystroke.as_ref().is_ok_and(|status| status.success()) {
-        return Ok(());
-    }
-    spawn_warp_tab(script)
-}
-
 fn spawn_warp_tab(script: &Path) -> Result<()> {
     let home = env::var_os("HOME").context("HOME is unset")?;
     let dir = PathBuf::from(home).join(".warp/tab_configs");
@@ -179,7 +168,7 @@ fn spawn_warp_tab(script: &Path) -> Result<()> {
     fs::write(&path, warp_tab_config(script))
         .with_context(|| format!("failed to write {}", path.display()))?;
     let status = Command::new("open")
-        .arg("warp://tab_config/trv-review")
+        .args(warp_open_args())
         .status()
         .context("failed to open a Warp tab for the review")?;
     if status.success() {
@@ -188,6 +177,12 @@ fn spawn_warp_tab(script: &Path) -> Result<()> {
         let _ = fs::remove_file(&path);
         bail!("failed to open a Warp tab for the review ({status})")
     }
+}
+
+fn warp_open_args() -> [&'static str; 2] {
+    // -g keeps Warp in the background so the review is ready when you
+    // switch back, instead of yanking focus from whatever you're doing.
+    ["-g", "warp://tab_config/trv-review"]
 }
 
 fn tmux_split_args(cwd: &Path, script: &Path) -> Vec<String> {
@@ -213,17 +208,6 @@ fn warp_tab_config(script: &Path) -> String {
 
 fn toml_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn warp_split_script(script: &Path) -> String {
-    let command = format!(
-        "exec sh {}",
-        shell_single_quote(&script.display().to_string())
-    );
-    format!(
-        "tell application \"System Events\"\nset warpProc to first process whose bundle identifier contains \"warp.Warp\"\ntell warpProc\nset frontmost to true\nkeystroke \"d\" using command down\ndelay 0.5\nkeystroke {}\nkey code 36\nend tell\nend tell",
-        applescript_quote(&command)
-    )
 }
 
 fn runner_script(
@@ -286,16 +270,12 @@ fn shell_single_quote(value: &str) -> String {
     quoted
 }
 
-fn applescript_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::{
-        Launch, launch_plan, runner_script, tmux_split_args, warp_split_script, warp_tab_config,
+        Launch, launch_plan, runner_script, tmux_split_args, warp_open_args, warp_tab_config,
     };
 
     #[test]
@@ -311,20 +291,16 @@ mod tests {
     }
 
     #[test]
-    fn warp_split_uses_this_window_not_a_new_app() {
-        let script = warp_split_script(Path::new("/tmp/trv-agent/run.sh"));
-        assert!(script.contains("keystroke \"d\" using command down"));
-        assert!(script.contains("exec sh '/tmp/trv-agent/run.sh'"));
-        assert!(script.contains("warp.Warp"));
-        assert!(!script.contains("Terminal.app"));
-    }
-
-    #[test]
-    fn warp_tab_config_runs_the_review_in_this_app() {
+    fn warp_opens_the_review_tab_without_stealing_focus() {
+        assert_eq!(
+            warp_open_args(),
+            ["-g", "warp://tab_config/trv-review"],
+            "open -g must keep Warp in the background"
+        );
         let config = warp_tab_config(Path::new("/tmp/trv-agent/run.sh"));
         assert!(config.contains("type = \"terminal\""));
         assert!(config.contains("exec sh '/tmp/trv-agent/run.sh'"));
-        assert!(!config.contains("Terminal.app"));
+        assert!(config.contains("is_focused = true"));
     }
 
     #[test]
@@ -356,8 +332,8 @@ mod tests {
         assert!(skill.contains("trv --agent"));
         assert!(skill.contains("3600000"));
         assert!(
-            skill.contains("split") || skill.contains("pane"),
-            "agents must expect a split pane when they have no tty"
+            skill.contains("without stealing focus") || skill.contains("tab"),
+            "agents must open the review without yanking the user's current window"
         );
         assert!(!skill.contains("Terminal.app"));
     }
