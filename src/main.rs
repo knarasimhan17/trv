@@ -33,23 +33,17 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let _handoff_guard = agent::HandoffGuard::from_env();
     let current_dir = env::current_dir().context("current directory is unavailable")?;
     let repository = Repository::discover(&current_dir)?;
 
     match cli.command {
         Some(Command::Revs) => print_revisions(&repository),
-        None => {
-            if cli.agent_mode() && agent::should_spawn() {
-                return agent::spawn_and_forward(cli.working_tree, cli.revset.as_deref());
-            }
-            run_review(
-                &repository,
-                cli.revset.as_deref(),
-                cli.working_tree,
-                cli.agent_mode(),
-            )
-        }
+        None => run_review(
+            &repository,
+            cli.revset.as_deref(),
+            cli.working_tree,
+            cli.agent_mode(),
+        ),
     }
 }
 

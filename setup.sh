@@ -27,36 +27,31 @@ fi
 
 cargo install --path "$script_dir"
 
-if command -v tmux >/dev/null 2>&1; then
-    exit 0
+skill_src="$script_dir/skills/trv"
+if [[ ! -f "$skill_src/SKILL.md" ]]; then
+    printf '%s\n' "agent skill is missing at $skill_src/SKILL.md" >&2
+    exit 1
 fi
 
-if command -v brew >/dev/null 2>&1; then
-    brew install tmux
-    exit 0
-fi
+# Vendor-neutral Agent Skills path plus the common coding-agent homes, so a
+# freshly installed trv is already the review workflow for Grok, Claude Code,
+# Codex, Cursor, Gemini, Copilot, and anything else that reads SKILL.md.
+skill_dests=(
+    "$HOME/.agents/skills/trv"
+    "$HOME/.grok/skills/trv"
+    "$HOME/.claude/skills/trv"
+    "$HOME/.codex/skills/trv"
+    "$HOME/.cursor/skills/trv"
+    "$HOME/.gemini/skills/trv"
+    "$HOME/.copilot/skills/trv"
+)
 
-root_command=()
-if [[ "$(id -u)" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        root_command=(sudo -n)
-    else
-        printf '%s\n' "tmux is missing; skipping installation because sudo is unavailable" >&2
-        exit 0
-    fi
-fi
+for dest in "${skill_dests[@]}"; do
+    mkdir -p "$(dirname "$dest")"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cp "$skill_src/SKILL.md" "$dest/SKILL.md"
+done
 
-if command -v apt-get >/dev/null 2>&1; then
-    "${root_command[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update
-    "${root_command[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
-elif command -v dnf >/dev/null 2>&1; then
-    "${root_command[@]}" dnf install -y tmux
-elif command -v yum >/dev/null 2>&1; then
-    "${root_command[@]}" yum install -y tmux
-elif command -v pacman >/dev/null 2>&1; then
-    "${root_command[@]}" pacman -Sy --noconfirm tmux
-elif command -v apk >/dev/null 2>&1; then
-    "${root_command[@]}" apk add tmux
-else
-    printf '%s\n' "tmux is missing; no supported package manager was found" >&2
-fi
+# Replaced by skills/trv when the in-session workflow landed.
+rm -rf "$HOME/.grok/skills/trv-agent"

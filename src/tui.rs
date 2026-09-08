@@ -595,6 +595,7 @@ pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<Review
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
+    attach_stdin_to_tty()?;
     let restore = TerminalWriter::open()?;
     let output = restore.try_clone()?;
     let _terminal_mode = TerminalMode::enter(restore)?;
@@ -602,6 +603,34 @@ fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Re
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().context("failed to clear terminal")?;
     operation(&mut terminal)
+}
+
+fn attach_stdin_to_tty() -> Result<()> {
+    if io::stdin().is_terminal() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("controlling terminal is unavailable")?;
+        // SAFETY: stdin is a pipe from the agent; keyboard input has to come
+        // from the controlling terminal. stdout stays the pipe so comments
+        // still return to the agent after the review.
+        let result = unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) };
+        if result < 0 {
+            return Err(io::Error::last_os_error())
+                .context("failed to attach stdin to the controlling terminal");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("trv --agent requires a Unix controlling terminal")
+    }
 }
 
 fn run_review(

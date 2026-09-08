@@ -2,8 +2,9 @@
 
 `trv` is a terminal code-review tool for Git changes. It is designed around
 vim-style navigation, inline comments, and immutable local review revisions. It
-closes the loop with coding agents: `trv --agent` opens the review in a visible
-terminal, and quitting sends comments back on stdout so the agent can iterate.
+closes the loop with coding agents: `trv --agent` takes over the current
+terminal for the review, then returns comments on stdout so the agent can
+iterate in the same session.
 
 ## Revisions
 
@@ -30,9 +31,11 @@ Run the setup script from the repository checkout:
 ./setup.sh
 ```
 
-The script installs `trv`, bootstraps Rust when needed, and installs `tmux` when
-a supported package manager is available. To install only the binary with an
-existing Rust toolchain, run:
+The script installs `trv`, bootstraps Rust when needed, and copies an [Agent
+Skill](https://agentskills.io) into the usual global skill directories (Grok,
+Claude Code, Codex, Cursor, Gemini, Copilot, and `~/.agents/skills`). After
+that, coding agents already know to run `trv --agent` when they finish a
+change. To install only the binary with an existing Rust toolchain, run:
 
 ```sh
 cargo install --path .
@@ -61,12 +64,12 @@ the next immutable revision for the current repository and branch.
 
 `trv revs` lists the stored revisions.
 
-`trv --agent` (or `trv --stdout`) is the agent loop. It opens the review in a
-visible terminal: a tmux split when `TMUX` is set, or a new Terminal.app window
-on macOS. Add comments as usual, then press `q`. Quitting submits whatever
-comments you left on stdout and unblocks the agent. Empty stdout means you
-accepted the diff; that does not create a revision. Non-empty comments persist
-the next immutable revision, same as a manual `y` export.
+`trv --agent` (or `trv --stdout`) is the agent loop. It takes over this
+terminal for the review (the same session the agent is using), then returns
+control when you quit. Add comments as usual, then press `q`. Quitting submits
+whatever comments you left on stdout and unblocks the agent. Empty stdout means
+you accepted the diff; that does not create a revision. Non-empty comments
+persist the next immutable revision, same as a manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)
@@ -74,8 +77,8 @@ REVIEW=$(trv --agent)
 ```
 
 The footer shows `q send comments` so it is obvious that quit returns the
-review to the agent. On Linux without tmux, `--agent` runs in the current
-terminal when a tty is available.
+review to the agent. If stdout is piped, the TUI draws on the controlling
+terminal so the agent can still capture comments.
 
 In the picker, use `j`/`k` to move, `Enter` to select, and `q` or `Esc` to go
 back. Press `?` for the current picker's keybindings.

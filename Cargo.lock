@@ -824,6 +824,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
