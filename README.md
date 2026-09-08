@@ -66,12 +66,15 @@ the next immutable revision for the current repository and branch.
 
 `trv --agent` (or `trv --stdout`) is the agent loop. If this process owns a
 tty, the review runs in place. If an agent captured stdin/stdout (no tty),
-it opens the review in this window without taking focus: a tmux split, or
-in Warp a new tab (`open -g`) so you can keep working and review when you
-switch back. Add comments as usual, then press `q`. Quitting submits
-whatever comments you left on stdout and unblocks the agent. Empty stdout
-means you accepted the diff; that does not create a revision. Non-empty
-comments persist the next immutable revision, same as a manual `y` export.
+it opens a review tab in this window without taking focus, then waits.
+Supported hosts: Warp (`open -g`), tmux (`new-window -d`), iTerm, Kitty,
+and WezTerm. On macOS, if none of those are the current terminal, it
+opens a new Terminal.app window so the review still works. You can keep
+working elsewhere and switch to the review when you're ready. Add comments as usual, then press `q`.
+Quitting submits whatever comments you left on stdout and unblocks the
+agent. Empty stdout means you accepted the diff; that does not create a
+revision. Non-empty comments persist the next immutable revision, same as
+a manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)
@@ -79,7 +82,7 @@ REVIEW=$(trv --agent)
 ```
 
 The footer shows `q send comments` so it is obvious that quit returns the
-review to the agent. The split pane gets a real tty, so color, scroll, and
+review to the agent. The review tab gets a real tty, so color, scroll, and
 `q` work; comments still come back on the agent's stdout.
 
 In the picker, use `j`/`k` to move, `Enter` to select, and `q` or `Esc` to go

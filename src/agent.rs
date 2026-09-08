@@ -21,6 +21,10 @@ pub(crate) enum Launch {
     Here,
     Tmux,
     Warp,
+    ITerm,
+    Kitty,
+    TerminalApp,
+    WezTerm,
 }
 
 pub(crate) struct HandoffGuard {
@@ -51,13 +55,18 @@ pub(crate) fn inner_handoff() -> Option<Handoff> {
     Some(Handoff { sink, done })
 }
 
-pub(crate) fn launch_plan(inner: bool, direct_tty: bool, in_tmux: bool, in_warp: bool) -> Launch {
+pub(crate) fn launch_plan(
+    inner: bool,
+    direct_tty: bool,
+    host: Option<Launch>,
+    macos: bool,
+) -> Launch {
     if inner || direct_tty {
         Launch::Here
-    } else if in_tmux {
-        Launch::Tmux
-    } else if in_warp {
-        Launch::Warp
+    } else if let Some(host) = host {
+        host
+    } else if macos {
+        Launch::TerminalApp
     } else {
         Launch::Here
     }
@@ -68,8 +77,8 @@ pub(crate) fn should_spawn() -> bool {
         launch_plan(
             inner_handoff().is_some(),
             io::stdin().is_terminal() && io::stdout().is_terminal(),
-            env::var_os("TMUX").is_some() && tmux_available(),
-            in_warp(),
+            detect_host(),
+            cfg!(target_os = "macos"),
         ),
         Launch::Here
     )
@@ -89,16 +98,15 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
     )
     .with_context(|| format!("failed to write {}", script.display()))?;
 
-    match launch_plan(
-        false,
-        false,
-        env::var_os("TMUX").is_some() && tmux_available(),
-        in_warp(),
-    ) {
+    match launch_plan(false, false, detect_host(), cfg!(target_os = "macos")) {
         Launch::Tmux => spawn_tmux(&cwd, &script)?,
         Launch::Warp => spawn_warp_tab(&script)?,
+        Launch::ITerm => spawn_iterm_tab(&script)?,
+        Launch::Kitty => spawn_kitty_tab(&cwd, &script)?,
+        Launch::TerminalApp => spawn_terminal_app(&script)?,
+        Launch::WezTerm => spawn_wezterm_tab(&cwd, &script)?,
         Launch::Here => bail!(
-            "trv --agent needs a pane in this window (Warp or tmux). Run it from a tty, inside tmux, or inside Warp."
+            "trv --agent needs a visible terminal. Run it from a tty, inside Warp, tmux, iTerm, Kitty, or WezTerm, or on macOS (falls back to Terminal.app)."
         ),
     }
 
@@ -132,6 +140,23 @@ fn complete_handoff(handoff: &Handoff, formatted: &str) -> Result<()> {
     Ok(())
 }
 
+fn detect_host() -> Option<Launch> {
+    if env::var_os("TMUX").is_some() && tmux_available() {
+        return Some(Launch::Tmux);
+    }
+    if in_warp() {
+        return Some(Launch::Warp);
+    }
+    match env::var("TERM_PROGRAM").ok().as_deref() {
+        Some("iTerm.app") | Some("iTerm2") => Some(Launch::ITerm),
+        Some("Apple_Terminal") => Some(Launch::TerminalApp),
+        Some("WezTerm") => Some(Launch::WezTerm),
+        Some("kitty") => Some(Launch::Kitty),
+        _ if env::var_os("KITTY_WINDOW_ID").is_some() => Some(Launch::Kitty),
+        _ => None,
+    }
+}
+
 fn in_warp() -> bool {
     env::var("TERM_PROGRAM").is_ok_and(|term| term == "WarpTerminal")
         || env::var("WARP_IS_LOCAL_SHELL_SESSION").is_ok()
@@ -150,13 +175,58 @@ fn tmux_available() -> bool {
 
 fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
     let status = Command::new("tmux")
-        .args(tmux_split_args(cwd, script))
+        .args(tmux_new_window_args(cwd, script))
         .status()
-        .context("failed to start tmux split")?;
+        .context("failed to start tmux window")?;
     if status.success() {
         Ok(())
     } else {
-        bail!("tmux split-window exited with {status}")
+        bail!("tmux new-window exited with {status}")
+    }
+}
+
+fn spawn_iterm_tab(script: &Path) -> Result<()> {
+    run_osascript(&iterm_tab_script(script), "iTerm")
+}
+
+fn spawn_terminal_app(script: &Path) -> Result<()> {
+    run_osascript(&terminal_app_script(script), "Terminal.app")
+}
+
+fn spawn_kitty_tab(cwd: &Path, script: &Path) -> Result<()> {
+    let status = Command::new("kitty")
+        .args(kitty_launch_args(cwd, script))
+        .status()
+        .context("failed to launch a Kitty tab")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("kitty @ launch exited with {status}")
+    }
+}
+
+fn spawn_wezterm_tab(cwd: &Path, script: &Path) -> Result<()> {
+    let status = Command::new("wezterm")
+        .args(wezterm_spawn_args(cwd, script))
+        .status()
+        .context("failed to spawn a WezTerm tab")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("wezterm cli spawn exited with {status}")
+    }
+}
+
+fn run_osascript(script: &str, host: &str) -> Result<()> {
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .with_context(|| format!("failed to open a {host} tab"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("osascript exited with {status} while opening a {host} tab")
     }
 }
 
@@ -185,14 +255,60 @@ fn warp_open_args() -> [&'static str; 2] {
     ["-g", "warp://tab_config/trv-review"]
 }
 
-fn tmux_split_args(cwd: &Path, script: &Path) -> Vec<String> {
+fn tmux_new_window_args(cwd: &Path, script: &Path) -> Vec<String> {
     vec![
-        "split-window".to_owned(),
-        "-h".to_owned(),
+        "new-window".to_owned(),
+        "-d".to_owned(),
         "-c".to_owned(),
         cwd.display().to_string(),
         format!("sh {}", shell_single_quote(&script.display().to_string())),
     ]
+}
+
+fn kitty_launch_args(cwd: &Path, script: &Path) -> Vec<String> {
+    vec![
+        "@".to_owned(),
+        "launch".to_owned(),
+        "--type=tab".to_owned(),
+        "--cwd".to_owned(),
+        cwd.display().to_string(),
+        "sh".to_owned(),
+        script.display().to_string(),
+    ]
+}
+
+fn wezterm_spawn_args(cwd: &Path, script: &Path) -> Vec<String> {
+    vec![
+        "cli".to_owned(),
+        "spawn".to_owned(),
+        "--cwd".to_owned(),
+        cwd.display().to_string(),
+        "sh".to_owned(),
+        script.display().to_string(),
+    ]
+}
+
+fn iterm_tab_script(script: &Path) -> String {
+    let command = format!("sh {}", shell_single_quote(&script.display().to_string()));
+    format!(
+        "tell application \"iTerm\"\ntell current window\ncreate tab with default profile command {}\nend tell\nend tell",
+        applescript_quote(&command)
+    )
+}
+
+fn terminal_app_script(script: &Path) -> String {
+    let command = format!(
+        "exec sh {}",
+        shell_single_quote(&script.display().to_string())
+    );
+    format!(
+        "tell application \"Terminal\"\ndo script {}\nend tell",
+        applescript_quote(&command)
+    )
+}
+
+fn applescript_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn warp_tab_config(script: &Path) -> String {
@@ -275,19 +391,59 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Launch, launch_plan, runner_script, tmux_split_args, warp_open_args, warp_tab_config,
+        Launch, iterm_tab_script, kitty_launch_args, launch_plan, runner_script,
+        terminal_app_script, tmux_new_window_args, warp_open_args, warp_tab_config,
+        wezterm_spawn_args,
     };
 
     #[test]
     fn a_real_tty_runs_in_place() {
-        assert_eq!(launch_plan(true, false, true, true), Launch::Here);
-        assert_eq!(launch_plan(false, true, false, true), Launch::Here);
+        assert_eq!(
+            launch_plan(true, false, Some(Launch::Warp), true),
+            Launch::Here
+        );
+        assert_eq!(
+            launch_plan(false, true, Some(Launch::ITerm), true),
+            Launch::Here
+        );
     }
 
     #[test]
-    fn agents_without_a_tty_split_this_window() {
-        assert_eq!(launch_plan(false, false, true, true), Launch::Tmux);
-        assert_eq!(launch_plan(false, false, false, true), Launch::Warp);
+    fn agents_without_a_tty_open_a_tab_in_this_window() {
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::Tmux), true),
+            Launch::Tmux
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::Warp), true),
+            Launch::Warp
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::ITerm), true),
+            Launch::ITerm
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::Kitty), true),
+            Launch::Kitty
+        );
+        assert_eq!(
+            launch_plan(false, false, Some(Launch::WezTerm), true),
+            Launch::WezTerm
+        );
+    }
+
+    #[test]
+    fn macos_falls_back_to_terminal_app() {
+        assert_eq!(
+            launch_plan(false, false, None, true),
+            Launch::TerminalApp,
+            "unknown hosts on macOS must still get a Terminal.app window"
+        );
+        assert_eq!(
+            launch_plan(false, false, None, false),
+            Launch::Here,
+            "non-macOS without a known host cannot invent a window"
+        );
     }
 
     #[test]
@@ -304,10 +460,48 @@ mod tests {
     }
 
     #[test]
-    fn tmux_split_runs_the_handoff_script() {
+    fn tmux_opens_a_background_window() {
         assert_eq!(
-            tmux_split_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
-            ["split-window", "-h", "-c", "/repo", "sh '/tmp/run.sh'"]
+            tmux_new_window_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
+            ["new-window", "-d", "-c", "/repo", "sh '/tmp/run.sh'"]
+        );
+    }
+
+    #[test]
+    fn iterm_opens_a_tab_without_activating() {
+        let script = iterm_tab_script(Path::new("/tmp/run.sh"));
+        assert!(script.contains("create tab with default profile command"));
+        assert!(!script.contains("activate"));
+    }
+
+    #[test]
+    fn kitty_and_wezterm_open_a_tab() {
+        assert_eq!(
+            kitty_launch_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
+            [
+                "@",
+                "launch",
+                "--type=tab",
+                "--cwd",
+                "/repo",
+                "sh",
+                "/tmp/run.sh"
+            ]
+        );
+        assert_eq!(
+            wezterm_spawn_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
+            ["cli", "spawn", "--cwd", "/repo", "sh", "/tmp/run.sh"]
+        );
+    }
+
+    #[test]
+    fn terminal_app_opens_a_new_window() {
+        let script = terminal_app_script(Path::new("/tmp/run.sh"));
+        assert!(script.contains("tell application \"Terminal\""));
+        assert!(script.contains("do script"));
+        assert!(
+            !script.contains("in front window"),
+            "fallback must create a window even if Terminal.app is not already open"
         );
     }
 
