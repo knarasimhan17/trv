@@ -4,8 +4,7 @@ mod diff_view;
 mod picker;
 mod review;
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
@@ -15,7 +14,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -30,53 +30,7 @@ use crate::session::{ReviewSession, ViewKind};
 
 pub(crate) use picker::{CommitPickerOutcome, run as run_picker};
 
-type TrvTerminal = Terminal<CrosstermBackend<TerminalWriter>>;
-
-enum TerminalWriter {
-    Stdout(io::Stdout),
-    Tty(File),
-}
-
-impl TerminalWriter {
-    fn open() -> Result<Self> {
-        if io::stdout().is_terminal() {
-            Ok(Self::Stdout(io::stdout()))
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-                .map(Self::Tty)
-                .context("controlling terminal is unavailable")
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        match self {
-            Self::Stdout(_) => Ok(Self::Stdout(io::stdout())),
-            Self::Tty(file) => file
-                .try_clone()
-                .map(Self::Tty)
-                .context("failed to clone controlling terminal"),
-        }
-    }
-}
-
-impl Write for TerminalWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Stdout(stdout) => stdout.write(buf),
-            Self::Tty(tty) => tty.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Stdout(stdout) => stdout.flush(),
-            Self::Tty(tty) => tty.flush(),
-        }
-    }
-}
+type TrvTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 pub(crate) enum ReviewOutcome {
     Export(Vec<Comment>),
@@ -242,7 +196,10 @@ impl App {
 
     fn view_label(&self) -> String {
         match self.viewing {
-            ViewKind::LiveMain => format!("rev-{} draft", self.session.next_rev()),
+            ViewKind::LiveMain => format!(
+                "current vs mainline (rev-{} draft)",
+                self.session.next_rev()
+            ),
             ViewKind::LiveSince(rev) => format!("current vs rev-{rev}"),
             ViewKind::Frozen(rev) => format!("rev-{rev}"),
         }
@@ -595,10 +552,8 @@ pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<Review
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
-    let restore = TerminalWriter::open()?;
-    let output = restore.try_clone()?;
-    let _terminal_mode = TerminalMode::enter(restore)?;
-    let backend = CrosstermBackend::new(output);
+    let _terminal_mode = TerminalMode::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().context("failed to clear terminal")?;
     operation(&mut terminal)
@@ -629,16 +584,14 @@ fn run_review(
 }
 
 struct TerminalMode {
-    restore: TerminalWriter,
     raw: bool,
     alternate: bool,
     mouse: bool,
 }
 
 impl TerminalMode {
-    fn enter(restore: TerminalWriter) -> Result<Self> {
+    fn enter() -> Result<Self> {
         let mut mode = Self {
-            restore,
             raw: false,
             alternate: false,
             mouse: false,
@@ -646,28 +599,33 @@ impl TerminalMode {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         mode.raw = true;
 
-        execute!(&mut mode.restore, EnterAlternateScreen)
-            .context("failed to enter alternate screen")?;
+        let mut output = io::stdout();
+        execute!(
+            output,
+            EnterAlternateScreen,
+            DisableLineWrap,
+            EnableMouseCapture,
+            Hide
+        )
+        .context("failed to enter the review screen")?;
         mode.alternate = true;
-        execute!(&mut mode.restore, EnableMouseCapture)
-            .context("failed to enable mouse capture")?;
         mode.mouse = true;
-        execute!(&mut mode.restore, Hide).context("failed to hide terminal cursor")?;
         Ok(mode)
     }
 }
 
 impl Drop for TerminalMode {
     fn drop(&mut self) {
+        let mut output = io::stdout();
         if self.mouse
-            && let Err(error) = execute!(&mut self.restore, DisableMouseCapture)
+            && let Err(error) = execute!(output, DisableMouseCapture)
         {
             eprintln!("trv: failed to disable mouse capture: {error}");
         }
         let screen_result = if self.alternate {
-            execute!(&mut self.restore, Show, LeaveAlternateScreen)
+            execute!(output, Show, EnableLineWrap, LeaveAlternateScreen)
         } else {
-            execute!(&mut self.restore, Show)
+            execute!(output, Show)
         };
         if let Err(error) = screen_result {
             eprintln!("trv: failed to restore terminal screen: {error}");

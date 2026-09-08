@@ -91,9 +91,18 @@ impl ReviewSession {
             })
             .transpose()?;
 
+        let mainline = last
+            .map(|revision| revision.base_commit_sha.as_str())
+            .unwrap_or(prepared.base_commit_sha.as_str());
+        let vs_main = if mainline == prepared.base_commit_sha {
+            ParsedDiff::parse(&prepared.diff)
+        } else {
+            ParsedDiff::parse(&repository.diff_trees(mainline, &prepared.tree_sha)?)
+        };
+
         Ok(Self {
             live: Some(LiveReview {
-                vs_main: ParsedDiff::parse(&prepared.diff),
+                vs_main,
                 vs_previous,
                 comments: Vec::new(),
             }),
@@ -173,6 +182,79 @@ mod tests {
         assert!(
             current.diff.contains("agent two"),
             "the live review must show the latest unreviewed tree"
+        );
+    }
+
+    #[test]
+    fn later_working_tree_reviews_stay_against_the_original_mainline() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let root = directory.path();
+        init_repo(root);
+        fs::write(root.join("file.rs"), "mainline\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "mainline"]);
+        fs::write(root.join("file.rs"), "reviewed\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "pr"]);
+
+        let repository = Repository::discover(root).unwrap();
+        let thread = repository.current_thread().unwrap();
+        let first = repository.prepare_review(Some("HEAD~1..HEAD")).unwrap();
+        persist_revision(
+            &repository,
+            &thread,
+            &first,
+            vec![Comment::open(
+                "file.rs".to_owned(),
+                1,
+                Side::New,
+                "from rev-1".to_owned(),
+            )],
+        )
+        .unwrap();
+
+        fs::write(root.join("file.rs"), "reviewed\nplus\n").unwrap();
+        let current = repository.prepare_review(None).unwrap();
+        let revisions = list_revisions(repository.git_dir(), &thread).unwrap();
+        let session = ReviewSession::open(&repository, &current, &revisions).unwrap();
+        let live = session.live.as_ref().expect("changed tree must stay live");
+
+        assert_eq!(session.initial, ViewKind::LiveMain);
+        assert!(
+            current.diff.contains("plus") && !current.diff.contains("mainline"),
+            "prepare_review of a dirty tree is vs HEAD, not vs the original mainline"
+        );
+        assert!(
+            live.vs_main
+                .files
+                .iter()
+                .any(|file| file.lines.iter().any(|line| line.text == "plus")),
+            "current vs mainline must include the new uncommitted line"
+        );
+        assert!(
+            live.vs_main
+                .files
+                .iter()
+                .any(|file| file.lines.iter().any(|line| line.text == "mainline")),
+            "current vs mainline must still show the original mainline change, not only rev-1"
+        );
+        let since = live
+            .vs_previous
+            .as_ref()
+            .map(|(_, diff)| diff)
+            .expect("interdiff since rev-1");
+        assert!(
+            since
+                .files
+                .iter()
+                .any(|file| file.lines.iter().any(|line| line.text == "plus"))
+        );
+        assert!(
+            !since
+                .files
+                .iter()
+                .any(|file| file.lines.iter().any(|line| line.text == "mainline")),
+            "current vs rev-1 must not be used as the mainline view"
         );
     }
 

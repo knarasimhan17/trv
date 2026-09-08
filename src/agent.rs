@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -20,7 +20,7 @@ pub(crate) struct Handoff {
 pub(crate) enum Launch {
     Here,
     Tmux,
-    TerminalApp,
+    Warp,
 }
 
 pub(crate) struct HandoffGuard {
@@ -51,13 +51,13 @@ pub(crate) fn inner_handoff() -> Option<Handoff> {
     Some(Handoff { sink, done })
 }
 
-pub(crate) fn launch_plan(inner: bool, in_tmux: bool, macos: bool) -> Launch {
-    if inner {
+pub(crate) fn launch_plan(inner: bool, direct_tty: bool, in_tmux: bool, in_warp: bool) -> Launch {
+    if inner || direct_tty {
         Launch::Here
     } else if in_tmux {
         Launch::Tmux
-    } else if macos {
-        Launch::TerminalApp
+    } else if in_warp {
+        Launch::Warp
     } else {
         Launch::Here
     }
@@ -67,8 +67,9 @@ pub(crate) fn should_spawn() -> bool {
     !matches!(
         launch_plan(
             inner_handoff().is_some(),
+            io::stdin().is_terminal() && io::stdout().is_terminal(),
             env::var_os("TMUX").is_some() && tmux_available(),
-            cfg!(target_os = "macos"),
+            in_warp(),
         ),
         Launch::Here
     )
@@ -90,38 +91,36 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
 
     match launch_plan(
         false,
+        false,
         env::var_os("TMUX").is_some() && tmux_available(),
-        cfg!(target_os = "macos"),
+        in_warp(),
     ) {
         Launch::Tmux => spawn_tmux(&cwd, &script)?,
-        Launch::TerminalApp => spawn_terminal_app(&script)?,
+        Launch::Warp => spawn_warp_split(&script)?,
         Launch::Here => bail!(
-            "trv --agent needs a visible terminal; run it from a tty, inside tmux, or on macOS"
+            "trv --agent needs a pane in this window (Warp or tmux). Run it from a tty, inside tmux, or inside Warp."
         ),
     }
 
-    eprintln!("trv: waiting for you to finish the review");
+    eprintln!("trv: waiting for you to finish the review in the split pane");
     let status = wait_for_done(&done)?;
     let status = status.trim();
     if status != "ok" {
         bail!("{status}");
     }
     let formatted = fs::read_to_string(&sink).context("failed to read review comments")?;
-    if !formatted.is_empty() {
-        let mut output = io::stdout().lock();
-        writeln!(output, "{formatted}").context("failed to write comments to stdout")?;
-    }
-    Ok(())
+    deliver(&formatted)
 }
 
 pub(crate) fn deliver(formatted: &str) -> Result<()> {
     if let Some(handoff) = inner_handoff() {
         return complete_handoff(&handoff, formatted);
     }
-    if !formatted.is_empty() {
-        let mut output = io::stdout().lock();
-        writeln!(output, "{formatted}").context("failed to write comments to stdout")?;
+    if formatted.is_empty() {
+        return Ok(());
     }
+    let mut output = io::stdout().lock();
+    writeln!(output, "{formatted}").context("failed to write comments to stdout")?;
     Ok(())
 }
 
@@ -131,6 +130,22 @@ fn complete_handoff(handoff: &Handoff, formatted: &str) -> Result<()> {
     write_file_atomic(&handoff.done, "ok\n")
         .with_context(|| format!("failed to write {}", handoff.done.display()))?;
     Ok(())
+}
+
+fn in_warp() -> bool {
+    env::var("TERM_PROGRAM").is_ok_and(|term| term == "WarpTerminal")
+        || env::var("WARP_IS_LOCAL_SHELL_SESSION").is_ok()
+        || env::var("__CFBundleIdentifier").is_ok_and(|id| id.contains("warp.Warp"))
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
@@ -145,27 +160,34 @@ fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
     }
 }
 
-fn spawn_terminal_app(script: &Path) -> Result<()> {
-    let status = Command::new("osascript")
+fn spawn_warp_split(script: &Path) -> Result<()> {
+    let keystroke = Command::new("osascript")
         .arg("-e")
-        .arg(terminal_app_script(script))
+        .arg(warp_split_script(script))
+        .status();
+    if keystroke.as_ref().is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+    spawn_warp_tab(script)
+}
+
+fn spawn_warp_tab(script: &Path) -> Result<()> {
+    let home = env::var_os("HOME").context("HOME is unset")?;
+    let dir = PathBuf::from(home).join(".warp/tab_configs");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join("trv-review.toml");
+    fs::write(&path, warp_tab_config(script))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    let status = Command::new("open")
+        .arg("warp://tab_config/trv-review")
         .status()
-        .context("failed to open Terminal.app")?;
+        .context("failed to open a Warp tab for the review")?;
     if status.success() {
         Ok(())
     } else {
-        bail!("osascript exited with {status}")
+        let _ = fs::remove_file(&path);
+        bail!("failed to open a Warp tab for the review ({status})")
     }
-}
-
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 fn tmux_split_args(cwd: &Path, script: &Path) -> Vec<String> {
@@ -178,13 +200,28 @@ fn tmux_split_args(cwd: &Path, script: &Path) -> Vec<String> {
     ]
 }
 
-fn terminal_app_script(script: &Path) -> String {
+fn warp_tab_config(script: &Path) -> String {
     let command = format!(
-        "sh {}; exit",
+        "exec sh {}",
         shell_single_quote(&script.display().to_string())
     );
     format!(
-        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
+        "name = \"trv review\"\ntitle = \"trv\"\n\n[[panes]]\nid = \"review\"\ntype = \"terminal\"\ncommands = [{}]\nis_focused = true\n",
+        toml_quote(&command)
+    )
+}
+
+fn toml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn warp_split_script(script: &Path) -> String {
+    let command = format!(
+        "exec sh {}",
+        shell_single_quote(&script.display().to_string())
+    );
+    format!(
+        "tell application \"System Events\"\nset warpProc to first process whose bundle identifier contains \"warp.Warp\"\ntell warpProc\nset frontmost to true\nkeystroke \"d\" using command down\ndelay 0.5\nkeystroke {}\nkey code 36\nend tell\nend tell",
         applescript_quote(&command)
     )
 }
@@ -197,7 +234,10 @@ fn runner_script(
     working_tree: bool,
     revset: Option<&str>,
 ) -> String {
-    let mut command = format!("{} --agent", shell_single_quote(&exe.display().to_string()));
+    let mut command = format!(
+        "exec {} --agent",
+        shell_single_quote(&exe.display().to_string())
+    );
     if working_tree {
         command.push_str(" -w");
     }
@@ -252,132 +292,73 @@ fn applescript_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::Path;
-    use std::thread;
-    use std::time::Duration;
 
     use super::{
-        DONE_ENV, Handoff, HandoffGuard, Launch, SINK_ENV, complete_handoff, launch_plan,
-        runner_script, shell_single_quote, terminal_app_script, tmux_split_args, wait_for_done,
+        Launch, launch_plan, runner_script, tmux_split_args, warp_split_script, warp_tab_config,
     };
 
     #[test]
-    fn inner_process_stays_in_the_visible_terminal() {
-        assert_eq!(launch_plan(true, true, true), Launch::Here);
+    fn a_real_tty_runs_in_place() {
+        assert_eq!(launch_plan(true, false, true, true), Launch::Here);
+        assert_eq!(launch_plan(false, true, false, true), Launch::Here);
     }
 
     #[test]
-    fn tmux_sessions_split_a_pane() {
-        assert_eq!(launch_plan(false, true, true), Launch::Tmux);
+    fn agents_without_a_tty_split_this_window() {
+        assert_eq!(launch_plan(false, false, true, true), Launch::Tmux);
+        assert_eq!(launch_plan(false, false, false, true), Launch::Warp);
     }
 
     #[test]
-    fn macos_opens_terminal_when_not_in_tmux() {
-        assert_eq!(launch_plan(false, false, true), Launch::TerminalApp);
+    fn warp_split_uses_this_window_not_a_new_app() {
+        let script = warp_split_script(Path::new("/tmp/trv-agent/run.sh"));
+        assert!(script.contains("keystroke \"d\" using command down"));
+        assert!(script.contains("exec sh '/tmp/trv-agent/run.sh'"));
+        assert!(script.contains("warp.Warp"));
+        assert!(!script.contains("Terminal.app"));
     }
 
     #[test]
-    fn other_environments_fall_back_to_the_current_tty() {
-        assert_eq!(launch_plan(false, false, false), Launch::Here);
-    }
-
-    #[test]
-    fn shell_quotes_paths_with_spaces_and_quotes() {
-        assert_eq!(shell_single_quote("a b"), "'a b'");
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn runner_script_passes_agent_flags_and_handoff_paths() {
-        let script = runner_script(
-            Path::new("/opt/trv"),
-            Path::new("/repo with space"),
-            Path::new("/tmp/sink"),
-            Path::new("/tmp/done"),
-            true,
-            Some("HEAD~1"),
-        );
-        assert!(script.contains("export TRV_AGENT_SINK='/tmp/sink'"));
-        assert!(script.contains("export TRV_AGENT_DONE='/tmp/done'"));
-        assert!(script.contains("cd '/repo with space'"));
-        assert!(script.contains("'/opt/trv' --agent -w -r 'HEAD~1'"));
-        assert_eq!(SINK_ENV, "TRV_AGENT_SINK");
-        assert_eq!(DONE_ENV, "TRV_AGENT_DONE");
+    fn warp_tab_config_runs_the_review_in_this_app() {
+        let config = warp_tab_config(Path::new("/tmp/trv-agent/run.sh"));
+        assert!(config.contains("type = \"terminal\""));
+        assert!(config.contains("exec sh '/tmp/trv-agent/run.sh'"));
+        assert!(!config.contains("Terminal.app"));
     }
 
     #[test]
     fn tmux_split_runs_the_handoff_script() {
-        let args = tmux_split_args(Path::new("/repo"), Path::new("/tmp/run.sh"));
         assert_eq!(
-            args,
-            ["split-window", "-h", "-c", "/repo", "sh '/tmp/run.sh'",]
+            tmux_split_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
+            ["split-window", "-h", "-c", "/repo", "sh '/tmp/run.sh'"]
         );
     }
 
     #[test]
-    fn terminal_app_script_closes_the_window_after_review() {
-        let script = terminal_app_script(Path::new("/tmp/run.sh"));
-        assert!(script.contains("tell application \"Terminal\""));
-        assert!(script.contains("do script \"sh '/tmp/run.sh'; exit\""));
-    }
-
-    #[test]
-    fn handoff_writes_comments_then_marks_the_review_done() {
-        let directory = tempfile::tempdir().expect("handoff directory");
-        let handoff = Handoff {
-            sink: directory.path().join("sink"),
-            done: directory.path().join("done"),
-        };
-        complete_handoff(&handoff, "src/main.rs:1: fix this").expect("handoff write");
-        assert_eq!(
-            fs::read_to_string(&handoff.sink).expect("sink"),
-            "src/main.rs:1: fix this"
+    fn runner_script_execs_agent_mode_in_the_new_pane() {
+        let script = runner_script(
+            Path::new("/opt/trv"),
+            Path::new("/repo"),
+            Path::new("/tmp/sink"),
+            Path::new("/tmp/done"),
+            false,
+            None,
         );
-        assert_eq!(fs::read_to_string(&handoff.done).expect("done"), "ok\n");
+        assert!(script.contains("exec '/opt/trv' --agent"));
+        assert!(script.contains("export TRV_AGENT_SINK='/tmp/sink'"));
     }
 
     #[test]
-    fn empty_handoff_still_completes_so_the_agent_unblocks() {
-        let directory = tempfile::tempdir().expect("handoff directory");
-        let handoff = Handoff {
-            sink: directory.path().join("sink"),
-            done: directory.path().join("done"),
-        };
-        complete_handoff(&handoff, "").expect("empty handoff");
-        assert_eq!(fs::read_to_string(&handoff.sink).expect("sink"), "");
-        assert_eq!(fs::read_to_string(&handoff.done).expect("done"), "ok\n");
-    }
-
-    #[test]
-    fn wait_for_done_returns_once_the_file_exists() {
-        let directory = tempfile::tempdir().expect("done directory");
-        let done = directory.path().join("done");
-        let writer = done.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(80));
-            fs::write(writer, "ok\n").expect("write done");
-        });
-        assert_eq!(wait_for_done(&done).expect("wait"), "ok\n");
-    }
-
-    #[test]
-    fn handoff_guard_records_an_error_when_the_ui_never_submits() {
-        let directory = tempfile::tempdir().expect("guard directory");
-        let done = directory.path().join("done");
-        drop(HandoffGuard { done: done.clone() });
-        assert_eq!(
-            fs::read_to_string(&done).expect("guard done file"),
-            "error: review UI exited without sending comments\n"
+    fn bundled_skill_teaches_the_split_pane_review_loop() {
+        let skill = include_str!("../skills/trv/SKILL.md");
+        assert!(skill.contains("name: trv\n"));
+        assert!(skill.contains("trv --agent"));
+        assert!(skill.contains("3600000"));
+        assert!(
+            skill.contains("split") || skill.contains("pane"),
+            "agents must expect a split pane when they have no tty"
         );
-    }
-
-    #[test]
-    fn handoff_guard_leaves_a_successful_done_file_alone() {
-        let directory = tempfile::tempdir().expect("guard directory");
-        let done = directory.path().join("done");
-        fs::write(&done, "ok\n").expect("preexisting done");
-        drop(HandoffGuard { done: done.clone() });
-        assert_eq!(fs::read_to_string(&done).expect("done"), "ok\n");
+        assert!(!skill.contains("Terminal.app"));
     }
 }

@@ -30,12 +30,16 @@ pub(crate) fn persist_revision(
         .with_context(|| format!("failed to create {}", thread_dir.display()))?;
 
     let rev = next_revision_number(&thread_dir)?;
+    let base_commit_sha = list_revisions(repository.git_dir(), thread)?
+        .first()
+        .map(|revision| revision.base_commit_sha.clone())
+        .unwrap_or_else(|| prepared.base_commit_sha.clone());
     let snapshot_commit_sha =
-        repository.create_snapshot_commit(&prepared.tree_sha, &prepared.base_commit_sha, rev)?;
+        repository.create_snapshot_commit(&prepared.tree_sha, &base_commit_sha, rev)?;
     let revision = Revision {
         rev,
         timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        base_commit_sha: prepared.base_commit_sha.clone(),
+        base_commit_sha,
         snapshot_commit_sha: snapshot_commit_sha.clone(),
         comments,
     };
