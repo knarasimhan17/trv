@@ -6,6 +6,36 @@ use std::process::{self, Command};
 
 use anyhow::{Context, Result, bail};
 
+pub(crate) struct HostPause {
+    pid: u32,
+}
+
+impl HostPause {
+    pub(crate) fn pause_session_host() -> Result<Option<Self>> {
+        let Some(pid) = host_tui_pid() else {
+            return Ok(None);
+        };
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+            if result != 0 {
+                return Err(io::Error::last_os_error())
+                    .context("failed to pause the agent UI while the review runs");
+            }
+        }
+        Ok(Some(Self { pid }))
+    }
+}
+
+impl Drop for HostPause {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.pid as i32, libc::SIGCONT);
+        }
+    }
+}
+
 pub(crate) fn session_tty() -> Result<File> {
     ignore_background_tty_signals();
     if term_is_unusable() {
@@ -77,7 +107,7 @@ pub(crate) fn tty_device(name: &str) -> Option<PathBuf> {
 fn ancestor_tty_path() -> Result<PathBuf> {
     let mut pid = process::id();
     for _ in 0..64 {
-        let info = process_tty(pid)?;
+        let info = process_info(pid)?;
         if let Some(path) = info.tty {
             return Ok(path);
         }
@@ -89,12 +119,40 @@ fn ancestor_tty_path() -> Result<PathBuf> {
     bail!("no ancestor process has a terminal")
 }
 
-struct ProcessTty {
-    ppid: u32,
-    tty: Option<PathBuf>,
+fn host_tui_pid() -> Option<u32> {
+    let self_pid = process::id();
+    let mut pid = self_pid;
+    for _ in 0..64 {
+        let info = process_info(pid).ok()?;
+        if pid != self_pid && is_host_tui(&info.comm) {
+            return Some(pid);
+        }
+        if info.ppid <= 1 {
+            break;
+        }
+        pid = info.ppid;
+    }
+    None
 }
 
-fn process_tty(pid: u32) -> Result<ProcessTty> {
+pub(crate) fn is_host_tui(comm: &str) -> bool {
+    let name = Path::new(comm)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(comm);
+    matches!(
+        name,
+        "grok" | "claude" | "codex" | "cursor" | "cursor-agent" | "gemini" | "amp" | "opencode"
+    )
+}
+
+struct ProcessInfo {
+    ppid: u32,
+    tty: Option<PathBuf>,
+    comm: String,
+}
+
+fn process_info(pid: u32) -> Result<ProcessInfo> {
     let output = Command::new("ps")
         .args([
             "-p",
@@ -105,6 +163,8 @@ fn process_tty(pid: u32) -> Result<ProcessTty> {
             "ppid=",
             "-o",
             "tty=",
+            "-o",
+            "comm=",
         ])
         .output()
         .context("failed to inspect process terminal")?;
@@ -115,7 +175,7 @@ fn process_tty(pid: u32) -> Result<ProcessTty> {
         .with_context(|| format!("failed to parse tty for pid {pid}"))
 }
 
-fn parse_ps_tty(line: &str) -> Result<ProcessTty> {
+fn parse_ps_tty(line: &str) -> Result<ProcessInfo> {
     let mut parts = line.split_whitespace();
     let _pid = parts.next().context("ps pid is missing")?;
     let ppid = parts
@@ -124,7 +184,8 @@ fn parse_ps_tty(line: &str) -> Result<ProcessTty> {
         .parse::<u32>()
         .context("ps ppid is not a number")?;
     let tty = parts.next().and_then(tty_device);
-    Ok(ProcessTty { ppid, tty })
+    let comm = parts.collect::<Vec<_>>().join(" ");
+    Ok(ProcessInfo { ppid, tty, comm })
 }
 
 fn attach_stdin(tty: &File) -> Result<()> {
@@ -167,7 +228,17 @@ fn term_is_unusable() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ps_tty, tty_device};
+    use super::{is_host_tui, parse_ps_tty, tty_device};
+
+    #[test]
+    fn host_tui_matches_agent_clis_not_shells() {
+        assert!(is_host_tui("grok"));
+        assert!(is_host_tui("/opt/homebrew/bin/claude"));
+        assert!(is_host_tui("codex"));
+        assert!(!is_host_tui("zsh"));
+        assert!(!is_host_tui("herdr"));
+        assert!(!is_host_tui("stable"));
+    }
 
     #[test]
     fn tty_device_skips_detached_processes() {

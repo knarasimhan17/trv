@@ -601,10 +601,12 @@ pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<Review
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
+    let _host = crate::tty::HostPause::pause_session_host()?;
+    let sharing_host = _host.is_some();
     let restore = TerminalWriter::open()?;
     let size_tty = restore.size_tty()?;
     let output = restore.try_clone()?;
-    let _terminal_mode = TerminalMode::enter(restore)?;
+    let _terminal_mode = TerminalMode::enter(restore, !sharing_host)?;
     let backend = SessionBackend {
         inner: CrosstermBackend::new(output),
         size_tty,
@@ -720,7 +722,7 @@ struct TerminalMode {
 }
 
 impl TerminalMode {
-    fn enter(restore: TerminalWriter) -> Result<Self> {
+    fn enter(restore: TerminalWriter, alternate: bool) -> Result<Self> {
         let mut mode = Self {
             restore,
             raw: false,
@@ -730,9 +732,11 @@ impl TerminalMode {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         mode.raw = true;
 
-        execute!(&mut mode.restore, EnterAlternateScreen)
-            .context("failed to enter alternate screen")?;
-        mode.alternate = true;
+        if alternate {
+            execute!(&mut mode.restore, EnterAlternateScreen)
+                .context("failed to enter alternate screen")?;
+            mode.alternate = true;
+        }
         execute!(&mut mode.restore, EnableMouseCapture)
             .context("failed to enable mouse capture")?;
         mode.mouse = true;
