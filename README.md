@@ -66,10 +66,12 @@ the next immutable revision for the current repository and branch.
 
 `trv --agent` (or `trv --stdout`) is the agent loop. It takes over this
 terminal for the review (the same session the agent is using), then returns
-control when you quit. Add comments as usual, then press `q`. Quitting submits
-whatever comments you left on stdout and unblocks the agent. Empty stdout means
-you accepted the diff; that does not create a revision. Non-empty comments
-persist the next immutable revision, same as a manual `y` export.
+control when you quit. If the process has no controlling terminal, it opens a
+visible review instead so you can still comment. Add comments as usual, then
+press `q`. Quitting submits whatever comments you left on stdout and unblocks
+the agent. Empty stdout means you accepted the diff; that does not create a
+revision. Non-empty comments persist the next immutable revision, same as a
+manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)

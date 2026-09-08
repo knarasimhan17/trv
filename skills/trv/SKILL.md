@@ -12,7 +12,7 @@ description: >
 
 This is the default way to hand work back to the user in a Git repo. After you make code changes, run the review in this session. Do not ask the user to paste comments.
 
-1. From the repository root, run `trv --agent` in the foreground and wait until it exits. It takes over this terminal for the review, then returns here. The user may take many minutes; set the command timeout to at least 3600000 ms (1 hour).
+1. From the repository root, run `trv --agent` in the foreground and wait until it exits. It takes over this terminal for the review, then returns here. If this command has no controlling terminal, trv still opens a visible review and prints comments on stdout. The user may take many minutes; set the command timeout to at least 3600000 ms (1 hour).
 2. Stdout is blank-line-separated `path:line: body` comments. Empty stdout means they accepted the diff.
 3. If there are comments, address them and run `trv --agent` again.
 4. Repeat until stdout is empty.
