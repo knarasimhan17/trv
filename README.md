@@ -2,9 +2,9 @@
 
 `trv` is a terminal code-review tool for Git changes. It is designed around
 vim-style navigation, inline comments, and immutable local review revisions. It
-closes the loop with coding agents: `trv --agent` takes over the current
-terminal for the review, then returns comments on stdout so the agent can
-iterate in the same session.
+closes the loop with coding agents: `trv --agent` opens the review in this
+window (in-place when it owns a tty, otherwise a split pane), then returns
+comments on stdout so the agent can iterate.
 
 ## Revisions
 
@@ -64,14 +64,13 @@ the next immutable revision for the current repository and branch.
 
 `trv revs` lists the stored revisions.
 
-`trv --agent` (or `trv --stdout`) is the agent loop. It takes over this
-terminal for the review (the same session the agent is using), then returns
-control when you quit. Agent runners that detach `/dev/tty` still attach to
-the parent session's terminal instead of opening a new window. Add comments
-as usual, then press `q`. Quitting submits whatever comments you left on
-stdout and unblocks the agent. Empty stdout means you accepted the diff; that
-does not create a revision. Non-empty comments persist the next immutable
-revision, same as a manual `y` export.
+`trv --agent` (or `trv --stdout`) is the agent loop. If this process owns a
+tty, the review runs in place. If an agent captured stdin/stdout (no tty),
+it splits this window — a tmux pane, or a Warp pane via ⌘D — and runs the
+review there. Add comments as usual, then press `q`. Quitting submits
+whatever comments you left on stdout and unblocks the agent. Empty stdout
+means you accepted the diff; that does not create a revision. Non-empty
+comments persist the next immutable revision, same as a manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)
@@ -79,8 +78,8 @@ REVIEW=$(trv --agent)
 ```
 
 The footer shows `q send comments` so it is obvious that quit returns the
-review to the agent. If stdout is piped, the TUI draws on the session
-terminal so the agent can still capture comments.
+review to the agent. The split pane gets a real tty, so color, scroll, and
+`q` work; comments still come back on the agent's stdout.
 
 In the picker, use `j`/`k` to move, `Enter` to select, and `q` or `Esc` to go
 back. Press `?` for the current picker's keybindings.

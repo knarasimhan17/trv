@@ -4,8 +4,7 @@ mod diff_view;
 mod picker;
 mod review;
 
-use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
@@ -18,9 +17,8 @@ use crossterm::terminal::{
     DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode,
 };
-use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
-use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -32,58 +30,7 @@ use crate::session::{ReviewSession, ViewKind};
 
 pub(crate) use picker::{CommitPickerOutcome, run as run_picker};
 
-type TrvTerminal = Terminal<SessionBackend>;
-
-enum TerminalWriter {
-    Stdout(io::Stdout),
-    Tty(File),
-}
-
-impl TerminalWriter {
-    fn open() -> Result<Self> {
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
-            Ok(Self::Stdout(io::stdout()))
-        } else {
-            Ok(Self::Tty(crate::tty::session_tty()?))
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        match self {
-            Self::Stdout(_) => Ok(Self::Stdout(io::stdout())),
-            Self::Tty(file) => file
-                .try_clone()
-                .map(Self::Tty)
-                .context("failed to clone session terminal"),
-        }
-    }
-
-    fn size_tty(&self) -> Result<Option<File>> {
-        match self {
-            Self::Stdout(_) => Ok(None),
-            Self::Tty(file) => file
-                .try_clone()
-                .map(Some)
-                .context("failed to clone session terminal"),
-        }
-    }
-}
-
-impl Write for TerminalWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Stdout(stdout) => stdout.write(buf),
-            Self::Tty(tty) => tty.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Stdout(stdout) => stdout.flush(),
-            Self::Tty(tty) => tty.flush(),
-        }
-    }
-}
+type TrvTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 pub(crate) enum ReviewOutcome {
     Export(Vec<Comment>),
@@ -602,92 +549,11 @@ pub(crate) fn run(session: ReviewSession, submit_on_quit: bool) -> Result<Review
 }
 
 fn with_terminal<T>(operation: impl FnOnce(&mut TrvTerminal) -> Result<T>) -> Result<T> {
-    let _host = crate::tty::HostPause::pause_session_host()?;
-    let restore = TerminalWriter::open()?;
-    let size_tty = restore.size_tty()?;
-    let output = restore.try_clone()?;
-    let _terminal_mode = TerminalMode::enter(restore)?;
-    let backend = SessionBackend {
-        inner: CrosstermBackend::new(output),
-        size_tty,
-    };
+    let _terminal_mode = TerminalMode::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().context("failed to clear terminal")?;
     operation(&mut terminal)
-}
-
-struct SessionBackend {
-    inner: CrosstermBackend<TerminalWriter>,
-    size_tty: Option<File>,
-}
-
-impl SessionBackend {
-    fn measured_size(&self) -> io::Result<Size> {
-        if let Some(tty) = &self.size_tty
-            && let Ok((width, height)) = crate::tty::winsize(tty)
-        {
-            return Ok(Size { width, height });
-        }
-        self.inner.size()
-    }
-}
-
-impl Backend for SessionBackend {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        self.inner.draw(content)
-    }
-
-    fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> io::Result<()> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
-        self.inner.get_cursor_position()
-    }
-
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-        self.inner.set_cursor_position(position)
-    }
-
-    fn clear(&mut self) -> io::Result<()> {
-        self.inner.clear()
-    }
-
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        self.inner.append_lines(n)
-    }
-
-    fn size(&self) -> io::Result<Size> {
-        self.measured_size()
-    }
-
-    fn window_size(&mut self) -> io::Result<WindowSize> {
-        match self.measured_size() {
-            Ok(size) => Ok(WindowSize {
-                columns_rows: size,
-                pixels: Size {
-                    width: 0,
-                    height: 0,
-                },
-            }),
-            Err(_) => self.inner.window_size(),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Backend::flush(&mut self.inner)
-    }
 }
 
 fn run_review(
@@ -715,16 +581,14 @@ fn run_review(
 }
 
 struct TerminalMode {
-    restore: TerminalWriter,
     raw: bool,
     alternate: bool,
     mouse: bool,
 }
 
 impl TerminalMode {
-    fn enter(restore: TerminalWriter) -> Result<Self> {
+    fn enter() -> Result<Self> {
         let mut mode = Self {
-            restore,
             raw: false,
             alternate: false,
             mouse: false,
@@ -732,8 +596,9 @@ impl TerminalMode {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         mode.raw = true;
 
+        let mut output = io::stdout();
         execute!(
-            &mut mode.restore,
+            output,
             EnterAlternateScreen,
             DisableLineWrap,
             EnableMouseCapture,
@@ -748,20 +613,16 @@ impl TerminalMode {
 
 impl Drop for TerminalMode {
     fn drop(&mut self) {
+        let mut output = io::stdout();
         if self.mouse
-            && let Err(error) = execute!(&mut self.restore, DisableMouseCapture)
+            && let Err(error) = execute!(output, DisableMouseCapture)
         {
             eprintln!("trv: failed to disable mouse capture: {error}");
         }
         let screen_result = if self.alternate {
-            execute!(
-                &mut self.restore,
-                Show,
-                EnableLineWrap,
-                LeaveAlternateScreen
-            )
+            execute!(output, Show, EnableLineWrap, LeaveAlternateScreen)
         } else {
-            execute!(&mut self.restore, Show)
+            execute!(output, Show)
         };
         if let Err(error) = screen_result {
             eprintln!("trv: failed to restore terminal screen: {error}");
