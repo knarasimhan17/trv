@@ -40,6 +40,7 @@ pub(super) enum ReviewContext {
     SideBySide,
     Comments,
     FileTree,
+    CommentsPanel,
 }
 
 impl ReviewContext {
@@ -49,6 +50,7 @@ impl ReviewContext {
             Self::SideBySide => "side-by-side review",
             Self::Comments => "comment list",
             Self::FileTree => "file list",
+            Self::CommentsPanel => "comments panel",
         }
     }
 }
@@ -71,6 +73,8 @@ pub(super) enum ReviewAction {
     EditComment,
     DeleteComment,
     OpenComments,
+    FocusCommentsPanel,
+    JumpToComment,
     OpenRevisions,
     ReturnToDiff,
     StartVisual,
@@ -118,6 +122,7 @@ enum ReviewScope {
     Comments,
     FileTree,
     DiffOrFileTree,
+    CommentsPanel,
 }
 
 impl ReviewScope {
@@ -132,6 +137,7 @@ impl ReviewScope {
                 context,
                 ReviewContext::Unified | ReviewContext::SideBySide | ReviewContext::FileTree
             ),
+            Self::CommentsPanel => context == ReviewContext::CommentsPanel,
         }
     }
 }
@@ -390,6 +396,34 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
         ReviewAction::OpenComments,
     ),
     review_binding(
+        ReviewScope::Diff,
+        &[plain(KeyCode::Char('C'))],
+        "C",
+        "Focus the comments panel",
+        ReviewAction::FocusCommentsPanel,
+    ),
+    review_binding(
+        ReviewScope::CommentsPanel,
+        &[plain(KeyCode::Enter)],
+        "Enter",
+        "Jump to the selected comment in the diff",
+        ReviewAction::JumpToComment,
+    ),
+    review_binding(
+        ReviewScope::CommentsPanel,
+        &[plain(KeyCode::Char('C')), plain(KeyCode::Esc)],
+        "C / Esc",
+        "Return to the diff",
+        ReviewAction::ReturnToDiff,
+    ),
+    review_binding(
+        ReviewScope::CommentsPanel,
+        &[plain(KeyCode::Char('l')), plain(KeyCode::Tab)],
+        "l / Tab",
+        "Open the comment list",
+        ReviewAction::OpenComments,
+    ),
+    review_binding(
         ReviewScope::Comments,
         &[
             plain(KeyCode::Char('l')),
@@ -451,6 +485,13 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
     ),
     review_binding(
         ReviewScope::Comments,
+        &[plain(KeyCode::Char('q'))],
+        "q",
+        "Quit the review",
+        ReviewAction::Quit,
+    ),
+    review_binding(
+        ReviewScope::CommentsPanel,
         &[plain(KeyCode::Char('q'))],
         "q",
         "Quit the review",

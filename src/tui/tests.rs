@@ -2084,3 +2084,249 @@ fn file_tree_help_documents_jump_keys() {
         "help must document f, got {rows:?}"
     );
 }
+
+fn comment_on_text(app: &mut App, text: &str, body: &str) {
+    app.select_diff(row_with_text(app, text));
+    app.start_comment();
+    save_open_comment(app, body);
+}
+
+fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, app))
+        .expect("review must render");
+    buffer_rows(terminal.backend().buffer())
+}
+
+#[test]
+fn comments_panel_stays_hidden_until_a_comment_exists() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        !rows.iter().any(|row| row.contains("comments |")),
+        "the running comments panel must hide when the review has no comments: {rows:?}"
+    );
+    assert!(
+        !footer_text(&app).contains("C comments"),
+        "the footer must not advertise the panel before any comments exist"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    assert!(
+        !app.panel_focused,
+        "C with no comments must not focus a hidden panel"
+    );
+    assert_eq!(app.status.as_deref(), Some("No comments."));
+
+    comment_on_text(&mut app, "new", "rename this");
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("comments | 1")),
+        "adding a comment must show the running comments panel: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("first.rs:1 [new] rename this")),
+        "the panel must show the comment location and body: {rows:?}"
+    );
+    assert!(
+        footer_text(&app).contains("C comments"),
+        "the footer must mention the comments panel once it is visible: {}",
+        footer_text(&app)
+    );
+    assert!(
+        app.comments_panel.area.height <= 6,
+        "the panel must stay small on an 80x24 terminal, got height {}",
+        app.comments_panel.area.height
+    );
+    assert!(
+        app.diff_list.inner.height >= 12,
+        "the diff must remain readable beside the panel, got height {}",
+        app.diff_list.inner.height
+    );
+}
+
+#[test]
+fn focusing_the_comments_panel_moves_j_k_without_stealing_diff_motion() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    comment_on_text(&mut app, "new", "first note");
+    comment_on_text(&mut app, "after", "second note");
+    app.select_diff(0);
+    let selected = app.selected_diff;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_diff,
+        selected + 1,
+        "j must still move the diff while the panel is not focused"
+    );
+    assert_eq!(
+        app.selected_comment, 1,
+        "adding comments selects the latest"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    assert!(app.panel_focused, "C must focus the comments panel");
+    let selected = app.selected_diff;
+    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_comment, 0,
+        "k in the focused panel must move within the comment list"
+    );
+    assert_eq!(
+        app.selected_diff, selected,
+        "k in the focused panel must not move the diff"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(app.selected_comment, 1);
+    assert_eq!(app.selected_diff, selected);
+
+    assert!(
+        footer_text(&app).contains("Enter jump"),
+        "the focused-panel footer must document jumping: {}",
+        footer_text(&app)
+    );
+}
+
+#[test]
+fn enter_on_a_panel_row_jumps_to_that_comment_in_the_diff() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    comment_on_text(&mut app, "new", "on first");
+    comment_on_text(&mut app, "after", "on second");
+    app.select_diff(0);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.collapsed_files[0],
+        "the fixture starts by collapsing the first file from the header"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(app.comments[app.selected_comment].body, "on first");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.path.as_str(), anchor.line, anchor.side)),
+        Some(("first.rs", 1, Side::New)),
+        "Enter on a panel row must select that comment's diff line"
+    );
+    assert!(
+        !app.collapsed_files[0],
+        "jumping to a comment must expand its file"
+    );
+    assert!(
+        app.panel_focused,
+        "jumping must keep the comments panel focused so the row stays highlighted"
+    );
+    assert_eq!(app.selected_comment, 0);
+}
+
+#[test]
+fn clicking_a_panel_row_jumps_to_that_comment() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    comment_on_text(&mut app, "new", "panel jump");
+    app.select_diff(0);
+
+    let rows = rendered_rows(&mut app, 80, 24);
+    let panel_y = rows
+        .iter()
+        .rposition(|row| row.contains("panel jump") && row.contains("first.rs:1"))
+        .expect("the comments panel must show the saved comment") as u16;
+    let inline_y = rows
+        .iter()
+        .position(|row| row.contains("panel jump"))
+        .expect("the inline comment must remain visible") as u16;
+    assert!(
+        panel_y > inline_y,
+        "the running panel must dock below the diff, got {rows:?}"
+    );
+
+    app.handle_mouse(click(8, panel_y));
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.path.as_str(), anchor.line)),
+        Some(("first.rs", 1)),
+        "clicking a panel row must jump the diff to that comment"
+    );
+    assert!(app.panel_focused, "clicking the panel must focus it");
+}
+
+#[test]
+fn frozen_revision_comments_appear_in_the_panel_read_only() {
+    let mut app = App::from_session(two_round_session());
+    app.viewing = ViewKind::Frozen(1);
+    app.load_view();
+    assert!(app.read_only);
+
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("comments | 1")),
+        "frozen revisions must show the comments panel: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("from rev-1") && row.contains("file.rs:1")),
+        "frozen revisions must list that rev's comments in the panel: {rows:?}"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.path.as_str(), anchor.line, anchor.side)),
+        Some(("file.rs", 1, Side::New)),
+        "activating a frozen panel row must still jump to that line"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert!(
+        matches!(app.mode, Mode::Diff),
+        "jumping from the panel must not start an edit on a frozen revision"
+    );
+}
+
+#[test]
+fn deleting_the_last_comment_hides_the_panel() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    comment_on_text(&mut app, "new", "temporary");
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    assert!(app.panel_focused);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+    assert!(app.comments.is_empty());
+    assert!(!app.panel_focused);
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        !rows.iter().any(|row| row.contains("comments |")),
+        "the panel must hide again once the last comment is deleted: {rows:?}"
+    );
+}
+
+#[test]
+fn help_documents_the_comments_panel() {
+    let mut app = App::new(ParsedDiff::parse(TWO_FILE_DIFF));
+    comment_on_text(&mut app, "new", "documented");
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Focus the comments panel")),
+        "diff help must mention C for the comments panel: {rows:?}"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert!(
+        rows.iter().any(|row| row.contains("comments panel")),
+        "focused-panel help must use the comments-panel context: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Jump to the selected comment")),
+        "focused-panel help must document Enter to jump: {rows:?}"
+    );
+}

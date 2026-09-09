@@ -93,6 +93,7 @@ impl App {
         self.file_tree_visible = !self.file_tree_visible;
         self.file_tree_focused = self.file_tree_visible;
         if self.file_tree_visible {
+            self.panel_focused = false;
             self.sync_file_tree_selection();
             self.status = Some("File list shown.".to_owned());
         } else {
@@ -264,6 +265,9 @@ impl App {
         if self.selected_comment >= self.comments.len() {
             self.selected_comment = self.comments.len().saturating_sub(1);
         }
+        if self.comments.is_empty() {
+            self.panel_focused = false;
+        }
         self.status = Some("Comment deleted.".to_owned());
     }
 
@@ -294,6 +298,110 @@ impl App {
             return;
         };
         self.delete_comment(index);
+    }
+
+    pub(super) fn focus_comments_panel(&mut self) {
+        if self.comments.is_empty() {
+            self.panel_focused = false;
+            self.status = Some("No comments.".to_owned());
+            return;
+        }
+        self.visual = None;
+        self.file_tree_focused = false;
+        self.panel_focused = true;
+        if self.selected_comment >= self.comments.len() {
+            self.selected_comment = self.comments.len().saturating_sub(1);
+        }
+        self.status = None;
+    }
+
+    pub(super) fn move_panel_comment(&mut self, down: bool) {
+        if self.comments.is_empty() {
+            self.panel_focused = false;
+            return;
+        }
+        if down {
+            if self.selected_comment + 1 < self.comments.len() {
+                self.selected_comment += 1;
+            }
+        } else {
+            self.selected_comment = self.selected_comment.saturating_sub(1);
+        }
+    }
+
+    pub(super) fn jump_to_comment(&mut self, index: usize) {
+        let Some(comment) = self.comments.get(index).cloned() else {
+            return;
+        };
+        self.visual = None;
+        self.selected_comment = index;
+        self.expand_file_for_path(&comment.path);
+        let row = self
+            .diff_row_index_for_comment(&comment, true)
+            .or_else(|| self.diff_row_index_for_comment(&comment, false));
+        if let Some(row) = row {
+            self.select_diff(row);
+            self.selected_side = comment.side;
+            self.normalize_selected_side();
+        } else if let Some(file) = self.file_index_for_path(&comment.path)
+            && let Some(header) = self
+                .diff_rows()
+                .iter()
+                .position(|row| matches!(row, DiffRow::File(index) if *index == file))
+        {
+            self.select_diff(header);
+        }
+    }
+
+    fn expand_file_for_path(&mut self, path: &str) {
+        if let Some(index) = self.file_index_for_path(path) {
+            self.collapsed_files[index] = false;
+        }
+    }
+
+    fn file_index_for_path(&self, path: &str) -> Option<usize> {
+        self.diff
+            .files
+            .iter()
+            .position(|file| file.path == path || file.previous_path.as_deref() == Some(path))
+    }
+
+    fn diff_row_index_for_comment(&self, comment: &Comment, start_only: bool) -> Option<usize> {
+        self.diff_rows()
+            .into_iter()
+            .position(|row| self.row_matches_comment(row, comment, start_only))
+    }
+
+    fn row_matches_comment(&self, row: DiffRow, comment: &Comment, start_only: bool) -> bool {
+        let line_matches = |line: &DiffLine| {
+            line.anchor_on(comment.side).is_some_and(|anchor| {
+                if start_only {
+                    anchor.path == comment.path && anchor.line == comment.start_line()
+                } else {
+                    comment.covers(&anchor.path, anchor.line, anchor.side)
+                }
+            })
+        };
+        match row {
+            DiffRow::File(_) => false,
+            DiffRow::Line { file, line } => self
+                .diff
+                .files
+                .get(file)
+                .and_then(|file| file.lines.get(line))
+                .is_some_and(line_matches),
+            DiffRow::SideBySide { file, row } => {
+                let Some(file) = self.diff.files.get(file) else {
+                    return false;
+                };
+                let line = match comment.side {
+                    Side::Old => row.old_line(),
+                    Side::New => row.new_line(),
+                };
+                line.and_then(|line| file.lines.get(line))
+                    .is_some_and(line_matches)
+            }
+        }
     }
 
     pub(super) fn toggle_selected_file(&mut self) -> bool {
