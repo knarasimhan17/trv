@@ -33,7 +33,10 @@ pub(crate) use picker::{CommitPickerOutcome, run as run_picker};
 type TrvTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 pub(crate) enum ReviewOutcome {
-    Export(Vec<Comment>),
+    Export {
+        comments: Vec<Comment>,
+        view: ViewKind,
+    },
     Quit,
 }
 
@@ -358,7 +361,17 @@ impl App {
             return None;
         }
         self.stash_live_comments();
-        Some(ReviewOutcome::Export(self.comments.clone()))
+        Some(ReviewOutcome::Export {
+            comments: self.comments.clone(),
+            view: self.export_view(),
+        })
+    }
+
+    fn export_view(&self) -> ViewKind {
+        match self.viewing {
+            ViewKind::Frozen(_) if self.session.live.is_some() => ViewKind::LiveMain,
+            view => view,
+        }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {

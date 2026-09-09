@@ -233,7 +233,10 @@ impl App {
     pub(super) fn request_quit(&mut self) -> Option<ReviewOutcome> {
         self.stash_live_comments();
         if self.submit_on_quit {
-            return Some(ReviewOutcome::Export(self.live_comments()));
+            return Some(ReviewOutcome::Export {
+                comments: self.live_comments(),
+                view: self.export_view(),
+            });
         }
         if self.pending_comments() == 0 {
             return Some(ReviewOutcome::Quit);

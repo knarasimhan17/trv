@@ -18,7 +18,7 @@ use crate::cli::{Cli, Command, ReviewLaunch, review_launch};
 use crate::export::{copy_to_clipboard, format_comments};
 use crate::git::{PreparedReview, Repository};
 use crate::persistence::{list_revisions, persist_revision};
-use crate::session::ReviewSession;
+use crate::session::{ReviewSession, export_meta};
 use crate::tui::{CommitPickerOutcome, ReviewOutcome};
 
 fn main() -> ExitCode {
@@ -141,7 +141,7 @@ fn finish_review(
     outcome: ReviewOutcome,
     agent: bool,
 ) -> Result<()> {
-    let ReviewOutcome::Export(comments) = outcome else {
+    let ReviewOutcome::Export { comments, view } = outcome else {
         if agent {
             agent::deliver("")?;
         }
@@ -152,8 +152,10 @@ fn finish_review(
         return agent::deliver("");
     }
 
+    let revisions = list_revisions(repository.git_dir(), thread)?;
+    let meta = export_meta(repository, thread, &prepared, view, &revisions);
     let revision = persist_revision(repository, thread, &prepared, comments)?;
-    let formatted = format_comments(&revision.comments);
+    let formatted = format_comments(&revision.comments, &meta);
 
     if agent {
         agent::deliver(&formatted)?;

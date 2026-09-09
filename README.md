@@ -94,7 +94,9 @@ a manual `y` export.
 
 ```sh
 REVIEW=$(trv --agent)
-# REVIEW is `path:line: body` or `path:start-end: body` blocks, or empty if you quit with no comments
+# Empty if you quit with no comments. Otherwise a metadata header (repository,
+# branch, view, base and reviewed SHAs) then a blank line, then
+# `path:line: body` or `path:start-end: body` blocks.
 ```
 
 The footer shows `q send comments` so it is obvious that quit returns the
