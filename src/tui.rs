@@ -50,6 +50,8 @@ enum Mode {
         anchor: LineAnchor,
         end_line: u32,
         body: String,
+        cursor: usize,
+        wrap_width: usize,
         existing: Option<usize>,
     },
     QuitConfirm {
@@ -534,8 +536,67 @@ impl App {
                 self.status = Some("Comment canceled.".to_owned());
             }
             KeyCode::Backspace => {
-                if let Mode::CommentInput { body, .. } = &mut self.mode {
-                    body.pop();
+                if let Mode::CommentInput { body, cursor, .. } = &mut self.mode {
+                    comment_input::backspace(body, cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if let Mode::CommentInput { body, cursor, .. } = &mut self.mode {
+                    comment_input::delete_forward(body, cursor);
+                }
+            }
+            KeyCode::Left => {
+                if let Mode::CommentInput { body, cursor, .. } = &mut self.mode {
+                    *cursor = comment_input::move_left(body, *cursor);
+                }
+            }
+            KeyCode::Right => {
+                if let Mode::CommentInput { body, cursor, .. } = &mut self.mode {
+                    *cursor = comment_input::move_right(body, *cursor);
+                }
+            }
+            KeyCode::Up => {
+                if let Mode::CommentInput {
+                    body,
+                    cursor,
+                    wrap_width,
+                    ..
+                } = &mut self.mode
+                {
+                    *cursor = comment_input::move_up(body, *cursor, *wrap_width);
+                }
+            }
+            KeyCode::Down => {
+                if let Mode::CommentInput {
+                    body,
+                    cursor,
+                    wrap_width,
+                    ..
+                } = &mut self.mode
+                {
+                    *cursor = comment_input::move_down(body, *cursor, *wrap_width);
+                }
+            }
+            KeyCode::Home => {
+                if let Mode::CommentInput {
+                    body,
+                    cursor,
+                    wrap_width,
+                    ..
+                } = &mut self.mode
+                {
+                    *cursor = comment_input::move_line_start(body, *cursor, *wrap_width);
+                }
+            }
+            KeyCode::End => {
+                if let Mode::CommentInput {
+                    body,
+                    cursor,
+                    wrap_width,
+                    ..
+                } = &mut self.mode
+                {
+                    *cursor = comment_input::move_line_end(body, *cursor, *wrap_width);
                 }
             }
             KeyCode::Enter => {
@@ -545,6 +606,7 @@ impl App {
                     end_line,
                     body,
                     existing,
+                    ..
                 } = mode
                 else {
                     unreachable!("input handling requires comment-input mode");
@@ -578,8 +640,8 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Mode::CommentInput { body, .. } = &mut self.mode {
-                    body.push(character);
+                if let Mode::CommentInput { body, cursor, .. } = &mut self.mode {
+                    comment_input::insert_char(body, cursor, character);
                 }
             }
             _ => {}
@@ -710,9 +772,23 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     };
     render_footer(frame, footer, app);
 
-    match &app.mode {
-        Mode::CommentInput { body, existing, .. } => {
-            comment_input::render(frame, content, body, selected_row, existing.is_some())
+    match &mut app.mode {
+        Mode::CommentInput {
+            body,
+            cursor,
+            wrap_width,
+            existing,
+            ..
+        } => {
+            *wrap_width = comment_input::wrap_width(content);
+            comment_input::render(
+                frame,
+                content,
+                body,
+                *cursor,
+                selected_row,
+                existing.is_some(),
+            )
         }
         Mode::QuitConfirm { .. } => render_quit_confirm(frame, app.pending_comments()),
         Mode::Diff | Mode::Comments => {}

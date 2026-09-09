@@ -343,6 +343,165 @@ diff --git file.rs file.rs
     );
 }
 
+fn commentable_app() -> App {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1 +1 @@
+-old
++new
+",
+    ));
+    app.select_diff(2);
+    app
+}
+
+fn type_chars(app: &mut App, text: &str) {
+    for character in text.chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+}
+
+fn open_comment(app: &App) -> (&str, usize) {
+    let Mode::CommentInput { body, cursor, .. } = &app.mode else {
+        panic!("comment input must be open");
+    };
+    (body, *cursor)
+}
+
+#[test]
+fn comment_input_left_right_move_the_cursor_from_the_end() {
+    let mut app = commentable_app();
+    let selected = app.selected_diff;
+    app.start_comment();
+    type_chars(&mut app, "hello");
+
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(body, "hello");
+    assert_eq!(
+        cursor, 3,
+        "two left arrows from the end must land before 'l'"
+    );
+    assert_eq!(
+        app.selected_diff, selected,
+        "arrows in the comment box must not leak through to the diff"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    let (_, cursor) = open_comment(&app);
+    assert_eq!(cursor, 4);
+}
+
+#[test]
+fn comment_input_inserts_and_deletes_at_the_cursor() {
+    let mut app = commentable_app();
+    app.start_comment();
+    type_chars(&mut app, "hello");
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    type_chars(&mut app, "X");
+
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(
+        body, "helXlo",
+        "typing must insert at the cursor, not the end"
+    );
+    assert_eq!(cursor, 4);
+
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(body, "hello");
+    assert_eq!(cursor, 3);
+
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(body, "helo");
+    assert_eq!(cursor, 3);
+}
+
+#[test]
+fn comment_input_up_down_move_between_wrapped_rows() {
+    let mut app = commentable_app();
+    app.start_comment();
+    type_chars(
+        &mut app,
+        &"x".repeat(super::comment_input::DEFAULT_WRAP_WIDTH + 10),
+    );
+
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(
+        cursor,
+        body.len(),
+        "typing must leave the cursor at the end"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let (_, cursor) = open_comment(&app);
+    assert_eq!(
+        cursor, 10,
+        "up from the end of a wrapped comment must keep the column on the previous row"
+    );
+
+    type_chars(&mut app, "Y");
+    let (body, _) = open_comment(&app);
+    assert_eq!(
+        &body[10..11],
+        "Y",
+        "typing after wrap-row up must insert on the previous visual row"
+    );
+    assert_eq!(body.len(), super::comment_input::DEFAULT_WRAP_WIDTH + 11);
+    assert!(!body.ends_with('Y'), "the insert must not append");
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(
+        cursor,
+        body.len(),
+        "down from the wrapped row must return to the last visual row"
+    );
+}
+
+#[test]
+fn comment_input_home_and_end_move_on_the_current_row() {
+    let mut app = commentable_app();
+    app.start_comment();
+    type_chars(&mut app, "hello");
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    let (_, cursor) = open_comment(&app);
+    assert_eq!(cursor, 0);
+
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let (body, cursor) = open_comment(&app);
+    assert_eq!(cursor, body.len());
+}
+
+#[test]
+fn comment_input_enter_esc_and_ctrl_d_keep_their_meanings() {
+    let mut app = commentable_app();
+    app.start_comment();
+    type_chars(&mut app, "keep");
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.comments[0].body, "keep");
+    assert!(matches!(app.mode, Mode::Diff));
+
+    app.start_comment();
+    type_chars(&mut app, "scratch");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(app.mode, Mode::Diff));
+    assert_eq!(app.comments.len(), 1);
+
+    app.edit_comment(0);
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(app.comments.is_empty());
+    assert!(matches!(app.mode, Mode::Diff));
+}
+
 #[test]
 fn quit_confirm_docks_to_the_bottom_instead_of_the_screen_center() {
     let screen = ratatui::layout::Rect::new(0, 0, 80, 24);
