@@ -23,6 +23,9 @@ impl App {
 
     pub(super) fn select_diff(&mut self, index: usize) {
         self.selected_diff = index.min(self.diff_rows().len().saturating_sub(1));
+        if let Some(file) = self.file_index_for_diff_row(self.selected_diff) {
+            self.selected_file = file;
+        }
         self.normalize_selected_side();
         self.status = None;
     }
@@ -83,6 +86,104 @@ impl App {
             })
         {
             self.select_diff(index);
+        }
+    }
+
+    pub(super) fn toggle_file_tree(&mut self) {
+        self.file_tree_visible = !self.file_tree_visible;
+        self.file_tree_focused = self.file_tree_visible;
+        if self.file_tree_visible {
+            self.sync_file_tree_selection();
+            self.status = Some("File list shown.".to_owned());
+        } else {
+            self.status = Some("File list hidden.".to_owned());
+        }
+    }
+
+    pub(super) fn unfocus_file_tree(&mut self) {
+        self.file_tree_focused = false;
+        self.status = None;
+    }
+
+    pub(super) fn move_file_tree(&mut self, down: bool) {
+        if self.diff.files.is_empty() {
+            return;
+        }
+        let last = self.diff.files.len() - 1;
+        let next = if down {
+            self.selected_file.saturating_add(1).min(last)
+        } else {
+            self.selected_file.saturating_sub(1)
+        };
+        self.select_file_tree(next);
+    }
+
+    pub(super) fn select_file_tree(&mut self, index: usize) {
+        if self.diff.files.is_empty() {
+            self.selected_file = 0;
+            return;
+        }
+        self.selected_file = index.min(self.diff.files.len() - 1);
+        self.status = None;
+    }
+
+    pub(super) fn activate_file_tree_row(&mut self) {
+        self.jump_to_file(self.selected_file);
+        self.file_tree_focused = false;
+    }
+
+    pub(super) fn jump_to_file(&mut self, file: usize) {
+        if file >= self.diff.files.len() {
+            return;
+        }
+        self.selected_file = file;
+        if self.collapsed_files.get(file) == Some(&true) {
+            self.collapsed_files[file] = false;
+        }
+        if let Some(index) = self
+            .diff_rows()
+            .iter()
+            .position(|row| matches!(row, DiffRow::File(index) if *index == file))
+        {
+            self.select_diff(index);
+        }
+        self.status = Some(format!(
+            "{} selected.",
+            self.diff.files[file].display_path()
+        ));
+    }
+
+    pub(super) fn select_file_at_pointer(&mut self, row: u16) {
+        let Some(index) = super::diff_view::item_index_at(
+            self.file_tree_list.inner,
+            &self.file_tree_list.heights,
+            self.file_tree_list.offset,
+            row,
+        ) else {
+            self.file_tree_focused = true;
+            return;
+        };
+        if index >= self.diff.files.len() {
+            self.file_tree_focused = true;
+            return;
+        }
+        self.file_tree_focused = true;
+        self.jump_to_file(index);
+    }
+
+    fn sync_file_tree_selection(&mut self) {
+        if let Some(file) = self.file_index_for_diff_row(self.selected_diff) {
+            self.selected_file = file;
+        } else {
+            self.selected_file = 0;
+        }
+    }
+
+    fn file_index_for_diff_row(&self, index: usize) -> Option<usize> {
+        match self.diff_rows().get(index)? {
+            DiffRow::File(file) | DiffRow::Line { file, .. } | DiffRow::SideBySide { file, .. } => {
+                Some(*file)
+            }
         }
     }
 

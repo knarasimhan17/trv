@@ -1853,3 +1853,234 @@ fn exporting_from_the_interdiff_records_that_view() {
         ["only the delta"]
     );
 }
+
+const FILE_TREE_DIFF: &str = "\
+diff --git src/a.rs src/a.rs
+--- src/a.rs
++++ src/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git src/nested/b.rs src/nested/b.rs
+--- src/nested/b.rs
++++ src/nested/b.rs
+@@ -1 +1 @@
+-before
++after
+diff --git README.md README.md
+new file mode 100644
+--- /dev/null
++++ README.md
+@@ -0,0 +1 @@
++docs
+";
+
+fn left_cols(row: &str, width: usize) -> String {
+    row.chars().take(width).collect()
+}
+
+#[test]
+fn file_tree_lists_parsed_files_and_jumps_to_the_header() {
+    let mut app = App::new(ParsedDiff::parse(FILE_TREE_DIFF));
+    assert!(
+        !app.file_tree_visible,
+        "the file list must start hidden so it does not eat the diff"
+    );
+    assert!(
+        footer_text(&app).contains("f files: off"),
+        "the footer must document how to open the file list: {}",
+        footer_text(&app)
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+
+    assert!(app.file_tree_visible, "f must show the file list");
+    assert!(app.file_tree_focused, "opening the file list must focus it");
+    assert_eq!(
+        app.diff
+            .files
+            .iter()
+            .map(|file| file.display_path())
+            .collect::<Vec<_>>(),
+        ["src/a.rs", "src/nested/b.rs", "README.md"],
+        "the panel must list every file from the parsed diff"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("file list must render");
+    let rows = buffer_rows(terminal.backend().buffer());
+    let tree_width = usize::from(app.file_tree_area.width.max(1));
+    let left = rows
+        .iter()
+        .map(|row| left_cols(row, tree_width))
+        .collect::<Vec<_>>();
+    assert!(
+        left.iter().any(|row| row.contains("src/a.rs")),
+        "the panel must show the first path, got {left:?}"
+    );
+    assert!(
+        left.iter()
+            .any(|row| row.contains("nested/b.rs") || row.contains("b.rs")),
+        "the panel must show nested paths even when truncated, got {left:?}"
+    );
+    assert!(
+        left.iter().any(|row| row.contains("README.md")),
+        "the panel must show the added file, got {left:?}"
+    );
+    assert!(
+        left.iter()
+            .any(|row| row.contains("+1") && row.contains("-1")),
+        "the panel must show add/delete counts from file headers, got {left:?}"
+    );
+    assert!(
+        tree_width <= 28,
+        "the file list must stay narrow on an 80-column terminal, got {tree_width}"
+    );
+    assert!(
+        footer_text(&app).contains("Enter jump"),
+        "the focused file-list footer must document jumping: {}",
+        footer_text(&app)
+    );
+
+    let selected_diff = app.selected_diff;
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(app.selected_file, 1, "j in the file list must move files");
+    assert_eq!(
+        app.selected_diff, selected_diff,
+        "j in the file list must not move the diff caret"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::File(1)),
+        "Enter must select the file header for the active row"
+    );
+    assert!(
+        !app.file_tree_focused,
+        "Enter must return focus to the diff so j/k move lines"
+    );
+    assert!(
+        app.file_tree_visible,
+        "jumping must keep the file list visible"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::Line { file: 1, line: 0 }),
+        "j must move diff lines again after leaving the file list"
+    );
+}
+
+#[test]
+fn file_tree_toggle_hides_the_panel_and_expands_collapsed_files() {
+    let mut app = App::new(ParsedDiff::parse(FILE_TREE_DIFF));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    assert!(app.file_tree_visible);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    assert!(
+        !app.file_tree_visible,
+        "f must hide the file list when it is already open"
+    );
+    assert!(!app.file_tree_focused);
+    assert!(
+        footer_text(&app).contains("f files: off"),
+        "hiding the list must restore the closed footer hint"
+    );
+
+    app.select_diff(0);
+    app.handle_diff_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.collapsed_files[0],
+        "the fixture must collapse the first file"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.select_file_tree(0);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        !app.collapsed_files[0],
+        "activating a collapsed file must expand it"
+    );
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::File(0)),
+        "activating a collapsed file must land on its header"
+    );
+}
+
+#[test]
+fn file_tree_keeps_bracket_file_motion_and_accepts_clicks() {
+    let mut app = App::new(ParsedDiff::parse(FILE_TREE_DIFF));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.file_tree_visible && !app.file_tree_focused,
+        "Esc must unfocus the list without hiding it"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::File(1)),
+        "] must still jump to the next file header"
+    );
+    assert_eq!(
+        app.selected_file, 1,
+        "bracket motion must keep the file list in sync"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::File(0)),
+        "[ must still jump to the previous file header"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("file list must render");
+    let rows = buffer_rows(terminal.backend().buffer());
+    let tree_width = usize::from(app.file_tree_area.width.max(1));
+    let line_y = rows
+        .iter()
+        .position(|row| left_cols(row, tree_width).contains("README.md"))
+        .expect("the added file must be visible in the list") as u16;
+    app.handle_mouse(click(app.file_tree_list.inner.x.saturating_add(2), line_y));
+    assert_eq!(
+        app.selected_row(),
+        Some(DiffRow::File(2)),
+        "clicking a file-list row must jump to that header"
+    );
+}
+
+#[test]
+fn file_tree_help_documents_jump_keys() {
+    let mut app = App::new(ParsedDiff::parse(FILE_TREE_DIFF));
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(app.help);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("help must render");
+    let rows = buffer_rows(terminal.backend().buffer());
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("file list"),
+        "help opened from the file list must use that context, got {rows:?}"
+    );
+    assert!(
+        screen.contains("Jump to the selected file"),
+        "help must document Enter, got {rows:?}"
+    );
+    assert!(
+        screen.contains("Show or hide the file list"),
+        "help must document f, got {rows:?}"
+    );
+}

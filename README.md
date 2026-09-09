@@ -113,11 +113,19 @@ kind and added/deleted line counts; raw Git patch metadata is omitted. Files
 start expanded. With a file header selected, use `Enter` or `Tab` to collapse or
 expand it.
 
+Press `f` to open a file list on the left. It lists every changed path with its
+change kind and `+add`/`-del` counts. With the list focused, `j`/`k` move
+between files and `Enter` or a click jumps to that file's header (and expands
+it if it was collapsed). `Esc` returns focus to the diff so `j`/`k` move lines
+again. `]`/`[` still jump between files. Press `f` again to hide the list. The
+panel stays narrow enough for an 80-column terminal.
+
 Inside a review, use `j`/`k` or the up/down arrows to move between lines, or
 click a line with the mouse. The scroll wheel also moves the selection. Use
-`]`/`[` to move between files, `g`/`G` to jump to the first or last line, `c`
-to add a comment, `v`/`V` to select a multi-line range and then `c` or `Enter`
-to comment on it, or click an added or deleted line to comment on that side.
+`]`/`[` to move between files, `f` to show or hide a file list, `g`/`G` to
+jump to the first or last line, `c` to add a comment, `v`/`V` to select a
+multi-line range and then `c` or `Enter` to comment on it, or click an added
+or deleted line to comment on that side.
 `Esc` or `v` cancels an in-progress range. Click an existing comment to edit it,
 `d` to delete the comment on the selected line (including any range that covers
 it), `l` to view comments, `r` to switch between the
