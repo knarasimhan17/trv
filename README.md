@@ -45,22 +45,32 @@ cargo install --path .
 
 ```sh
 trv
+trv -b
 trv -w
 trv -r <revset>
 trv revs
 trv --agent
 ```
 
-If the working tree has uncommitted changes, `trv` reviews them against `HEAD`
-directly. If the working tree is clean, it opens a picker of the latest 200
-commits on the current branch. Commits not found on any remote-tracking ref
-are marked as unpushed. Selecting a commit opens a second picker for its base,
+If the current branch is ahead of mainline (`origin/main`, `origin/master`,
+`main`, …), `trv` can review the whole stack as one diff, like a GitHub pull
+request. Uncommitted work on that branch is included. `trv --agent` and a dirty
+feature branch take this path directly. On a clean feature branch, the picker
+lists **this branch vs origin/main** first; `Enter` reviews the combined
+commits. Selecting a commit still opens a second picker for its base,
 preselected to the commit's first parent.
 
-`trv -w` (or `trv --working-tree`) reviews the current working tree against
-`HEAD` directly, even when it is clean. `trv -r <revset>` reviews a commit or
-revision range directly. Both flags skip the picker. Exporting comments creates
-the next immutable revision for the current repository and branch.
+If the working tree has uncommitted changes on mainline, `trv` reviews them
+against `HEAD` directly. If the working tree is clean and HEAD is not ahead of
+mainline, it opens a picker of the latest 200 commits on the current branch.
+Commits not found on any remote-tracking ref are marked as unpushed.
+
+`trv -b` (or `trv --branch`) reviews the current branch against mainline
+directly, including uncommitted changes. `trv -w` (or `trv --working-tree`)
+reviews the current working tree against `HEAD` only, even when it is clean.
+`trv -r <revset>` reviews a commit or revision range directly. These flags skip
+the picker. Exporting comments creates the next immutable revision for the
+current repository and branch.
 
 `trv revs` lists the stored revisions.
 

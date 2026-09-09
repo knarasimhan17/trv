@@ -84,7 +84,11 @@ pub(crate) fn should_spawn() -> bool {
     )
 }
 
-pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Result<()> {
+pub(crate) fn spawn_and_forward(
+    working_tree: bool,
+    branch: bool,
+    revset: Option<&str>,
+) -> Result<()> {
     let dir = tempfile::tempdir().context("failed to create agent handoff directory")?;
     let sink = dir.path().join("sink");
     let done = dir.path().join("done");
@@ -94,7 +98,7 @@ pub(crate) fn spawn_and_forward(working_tree: bool, revset: Option<&str>) -> Res
 
     fs::write(
         &script,
-        runner_script(&exe, &cwd, &sink, &done, working_tree, revset),
+        runner_script(&exe, &cwd, &sink, &done, working_tree, branch, revset),
     )
     .with_context(|| format!("failed to write {}", script.display()))?;
 
@@ -332,6 +336,7 @@ fn runner_script(
     sink: &Path,
     done: &Path,
     working_tree: bool,
+    branch: bool,
     revset: Option<&str>,
 ) -> String {
     let mut command = format!(
@@ -340,6 +345,9 @@ fn runner_script(
     );
     if working_tree {
         command.push_str(" -w");
+    }
+    if branch {
+        command.push_str(" -b");
     }
     if let Some(revset) = revset {
         command.push_str(" -r ");
@@ -513,9 +521,10 @@ mod tests {
             Path::new("/tmp/sink"),
             Path::new("/tmp/done"),
             false,
+            true,
             None,
         );
-        assert!(script.contains("exec '/opt/trv' --agent"));
+        assert!(script.contains("exec '/opt/trv' --agent -b"));
         assert!(script.contains("export TRV_AGENT_SINK='/tmp/sink'"));
     }
 
