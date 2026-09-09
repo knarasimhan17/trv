@@ -328,6 +328,14 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
         "Delete the comment on the selected line",
         ReviewAction::DeleteComment,
     ),
+    // Mouse-only: empty keys so click-to-edit shows in help without a key match.
+    review_binding(
+        ReviewScope::Diff,
+        &[],
+        "click comment",
+        "Edit an existing inline comment",
+        ReviewAction::EditComment,
+    ),
     review_binding(
         ReviewScope::Comments,
         &[plain(KeyCode::Char('c')), plain(KeyCode::Enter)],

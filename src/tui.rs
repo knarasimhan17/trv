@@ -807,11 +807,11 @@ fn footer_text(app: &App) -> String {
             }
         }
         View::Comments if app.submit_on_quit => format!(
-            "l/Tab/Esc review | q send comments | {}",
+            "l/Tab/Esc review | c edit | d delete | q send comments | {}",
             bindings::HELP_HINT
         ),
         View::Comments => format!(
-            "l/Tab/Esc review | y export | q quit | {}",
+            "l/Tab/Esc review | c edit | d delete | y export | q quit | {}",
             bindings::HELP_HINT
         ),
     };

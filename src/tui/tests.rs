@@ -909,6 +909,63 @@ diff --git file.rs file.rs
 }
 
 #[test]
+fn help_and_footer_document_how_to_edit_comments() {
+    let mut app = App::new(ParsedDiff::parse(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1 +1 @@
+-old
++new
+",
+    ));
+
+    app.mode = Mode::Comments;
+    assert!(
+        footer_text(&app).contains("c edit"),
+        "the comment list footer must document c to edit: {}",
+        footer_text(&app)
+    );
+    assert!(
+        footer_text(&app).contains("d delete"),
+        "the comment list footer must document d to delete: {}",
+        footer_text(&app)
+    );
+
+    app.mode = Mode::Diff;
+    app.help = true;
+    let mut terminal = Terminal::new(TestBackend::new(80, 28)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("review help must render");
+    let diff_help = buffer_rows(terminal.backend().buffer()).join("\n");
+    assert!(
+        diff_help.contains("click comment"),
+        "diff help must document click-to-edit, got {diff_help}"
+    );
+    assert!(
+        diff_help.contains("Edit an existing inline comment"),
+        "diff help must describe click-to-edit, got {diff_help}"
+    );
+
+    app.mode = Mode::Comments;
+    app.help = true;
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("comment list help must render");
+    let list_help = buffer_rows(terminal.backend().buffer()).join("\n");
+    assert!(
+        list_help.contains("c / Enter"),
+        "comment list help must document the edit keys, got {list_help}"
+    );
+    assert!(
+        list_help.contains("Edit the selected comment"),
+        "comment list help must describe editing, got {list_help}"
+    );
+}
+
+#[test]
 fn comment_list_can_edit_and_delete_the_selected_comment() {
     let mut app = App::new(ParsedDiff::parse(
         "\
