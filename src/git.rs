@@ -28,10 +28,16 @@ pub(crate) struct Repository {
 pub(crate) struct CommitLogEntry {
     pub(crate) sha: String,
     pub(crate) short_sha: String,
-    pub(crate) first_parent_sha: Option<String>,
+    pub(crate) parent_shas: Vec<String>,
     pub(crate) subject: String,
     pub(crate) committed_at: DateTime<Utc>,
     pub(crate) unpushed: bool,
+}
+
+impl CommitLogEntry {
+    pub(crate) fn first_parent_sha(&self) -> Option<&str> {
+        self.parent_shas.first().map(String::as_str)
+    }
 }
 
 pub(crate) struct PreparedReview {
@@ -431,7 +437,10 @@ fn parse_commit_log(output: &[u8]) -> Result<Vec<CommitLogEntry>> {
         commits.push(CommitLogEntry {
             sha: metadata_field(record[0], "commit SHA")?.to_owned(),
             short_sha: metadata_field(record[1], "short commit SHA")?.to_owned(),
-            first_parent_sha: parents.split_ascii_whitespace().next().map(str::to_owned),
+            parent_shas: parents
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect(),
             subject: metadata_field(record[4], "commit subject")?.to_owned(),
             committed_at,
             unpushed: false,
@@ -554,7 +563,10 @@ docs: initial commit\0";
                 CommitLogEntry {
                     sha: "1111111111111111111111111111111111111111".to_owned(),
                     short_sha: "1111111".to_owned(),
-                    first_parent_sha: Some("2222222222222222222222222222222222222222".to_owned()),
+                    parent_shas: vec![
+                        "2222222222222222222222222222222222222222".to_owned(),
+                        "3333333333333333333333333333333333333333".to_owned(),
+                    ],
                     subject: "feat: add picker".to_owned(),
                     committed_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
                         .expect("the fixture timestamp must be representable"),
@@ -563,7 +575,7 @@ docs: initial commit\0";
                 CommitLogEntry {
                     sha: "2222222222222222222222222222222222222222".to_owned(),
                     short_sha: "2222222".to_owned(),
-                    first_parent_sha: None,
+                    parent_shas: Vec::new(),
                     subject: "docs: initial commit".to_owned(),
                     committed_at: DateTime::<Utc>::from_timestamp(1_690_000_000, 0)
                         .expect("the fixture timestamp must be representable"),

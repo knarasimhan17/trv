@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
@@ -42,6 +44,7 @@ enum PickerStep {
 struct CommitPicker {
     branch: Option<BranchStack>,
     commits: Vec<CommitLogEntry>,
+    graph_prefixes: Vec<String>,
     step: PickerStep,
     now: DateTime<Utc>,
     help: bool,
@@ -54,9 +57,11 @@ enum SourceRow {
 
 impl CommitPicker {
     fn new(commits: Vec<CommitLogEntry>, branch: Option<BranchStack>) -> Self {
+        let graph_prefixes = commit_graph_prefixes(&commits);
         Self {
             branch,
             commits,
+            graph_prefixes,
             step: PickerStep::Source { selected: 0 },
             now: Utc::now(),
             help: false,
@@ -125,8 +130,7 @@ impl CommitPicker {
                         .get(index)
                         .expect("source picker index must be bounded by the commit list");
                     let base = commit
-                        .first_parent_sha
-                        .as_deref()
+                        .first_parent_sha()
                         .and_then(|parent| {
                             self.commits.iter().position(|commit| commit.sha == parent)
                         })
@@ -191,6 +195,14 @@ impl CommitPicker {
             PickerStep::Source { selected } | PickerStep::Base { selected, .. } => selected,
         }
     }
+
+    fn commit_items(&self, area_width: u16) -> Vec<ListItem<'static>> {
+        self.commits
+            .iter()
+            .zip(self.graph_prefixes.iter())
+            .map(|(commit, graph)| commit_item(commit, graph, &self.now, area_width))
+            .collect()
+    }
 }
 
 pub(crate) fn run(
@@ -240,12 +252,7 @@ fn render(frame: &mut Frame<'_>, picker: &CommitPicker) {
             if let Some(branch) = &picker.branch {
                 items.push(branch_item(branch));
             }
-            items.extend(
-                picker
-                    .commits
-                    .iter()
-                    .map(|commit| commit_item(commit, &picker.now, area.width)),
-            );
+            items.extend(picker.commit_items(area.width));
             (" trv | select review ".to_owned(), items)
         }
         PickerStep::Base { source, .. } => {
@@ -253,11 +260,7 @@ fn render(frame: &mut Frame<'_>, picker: &CommitPicker) {
                 .commits
                 .get(source)
                 .expect("base picker source index must be bounded by the commit list");
-            let items = picker
-                .commits
-                .iter()
-                .map(|commit| commit_item(commit, &picker.now, area.width))
-                .collect();
+            let items = picker.commit_items(area.width);
             (
                 format!(" trv | select base for {} ", source.short_sha),
                 items,
@@ -307,11 +310,16 @@ fn branch_item(branch: &BranchStack) -> ListItem<'static> {
     ]))
 }
 
-fn commit_item(commit: &CommitLogEntry, now: &DateTime<Utc>, area_width: u16) -> ListItem<'static> {
+fn commit_item(
+    commit: &CommitLogEntry,
+    graph: &str,
+    now: &DateTime<Utc>,
+    area_width: u16,
+) -> ListItem<'static> {
     // Two border columns and the two-column selection marker are unavailable to row text.
     const LIST_CHROME_WIDTH: u16 = 4;
 
-    let prefix = format!("{}  ", commit.short_sha);
+    let prefix = format!("{graph}{}  ", commit.short_sha);
     let age = relative_age(&commit.committed_at, now);
     let indicator = if commit.unpushed { "  [unpushed]" } else { "" };
     let suffix = format!("  {age}{indicator}");
@@ -322,7 +330,11 @@ fn commit_item(commit: &CommitLogEntry, now: &DateTime<Utc>, area_width: u16) ->
     let subject = truncate_to_width(&commit.subject, subject_width);
 
     let mut spans = vec![
-        Span::styled(prefix, Style::default().fg(Color::Cyan)),
+        Span::styled(graph.to_owned(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}  ", commit.short_sha),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::raw(subject),
         Span::styled(format!("  {age}"), Style::default().fg(Color::DarkGray)),
     ];
@@ -390,12 +402,184 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
+const GRAPH_NORTH: u8 = 1 << 0;
+const GRAPH_SOUTH: u8 = 1 << 1;
+const GRAPH_EAST: u8 = 1 << 2;
+const GRAPH_WEST: u8 = 1 << 3;
+const GRAPH_NODE: u8 = 1 << 4;
+
+fn commit_graph_prefixes(commits: &[CommitLogEntry]) -> Vec<String> {
+    let in_list = commits
+        .iter()
+        .map(|commit| commit.sha.as_str())
+        .collect::<HashSet<_>>();
+    let mut lanes: Vec<Option<&str>> = Vec::new();
+    let mut prefixes = Vec::with_capacity(commits.len());
+
+    for commit in commits {
+        let reserved = lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lane)| (*lane == Some(commit.sha.as_str())).then_some(index))
+            .collect::<Vec<_>>();
+        let commit_lane = reserved.first().copied().unwrap_or_else(|| {
+            lanes
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(lanes.len())
+        });
+
+        let mut next = lanes.clone();
+        if commit_lane >= next.len() {
+            next.resize(commit_lane + 1, None);
+        }
+        for &index in &reserved {
+            next[index] = None;
+        }
+        next[commit_lane] = None;
+
+        let mut parent_lanes = Vec::new();
+        let mut used_commit_lane = false;
+        for parent in commit.parent_shas.iter().map(String::as_str) {
+            if !in_list.contains(parent) {
+                continue;
+            }
+            if let Some(existing) = next.iter().position(|lane| *lane == Some(parent)) {
+                parent_lanes.push(existing);
+                continue;
+            }
+            let slot = if !used_commit_lane {
+                used_commit_lane = true;
+                commit_lane
+            } else {
+                next.iter().position(Option::is_none).unwrap_or(next.len())
+            };
+            if slot == next.len() {
+                next.push(None);
+            }
+            next[slot] = Some(parent);
+            parent_lanes.push(slot);
+        }
+
+        let incoming = reserved
+            .iter()
+            .copied()
+            .filter(|index| *index != commit_lane)
+            .collect::<Vec<_>>();
+        prefixes.push(graph_row_prefix(
+            &lanes,
+            &next,
+            commit_lane,
+            &parent_lanes,
+            &incoming,
+        ));
+
+        lanes = next;
+        while matches!(lanes.last(), Some(None)) {
+            lanes.pop();
+        }
+    }
+
+    let width = prefixes
+        .iter()
+        .map(|prefix| UnicodeWidthStr::width(prefix.as_str()))
+        .max()
+        .unwrap_or(0);
+    for prefix in &mut prefixes {
+        let padding = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+        prefix.push_str(&" ".repeat(padding));
+    }
+    prefixes
+}
+
+fn graph_row_prefix(
+    lanes: &[Option<&str>],
+    next: &[Option<&str>],
+    commit_lane: usize,
+    parent_lanes: &[usize],
+    incoming: &[usize],
+) -> String {
+    let columns = lanes
+        .len()
+        .max(next.len())
+        .max(commit_lane.saturating_add(1));
+    let mut flags = vec![0_u8; columns];
+    for index in 0..columns {
+        if lanes.get(index).copied().flatten().is_some() {
+            flags[index] |= GRAPH_NORTH;
+        }
+        if next.get(index).copied().flatten().is_some() {
+            flags[index] |= GRAPH_SOUTH;
+        }
+    }
+    flags[commit_lane] |= GRAPH_NODE;
+
+    let mut connected = incoming.to_vec();
+    connected.extend(
+        parent_lanes
+            .iter()
+            .copied()
+            .filter(|index| *index != commit_lane),
+    );
+    if let Some(min) = connected.iter().copied().chain([commit_lane]).min()
+        && let Some(max) = connected.iter().copied().chain([commit_lane]).max()
+        && min != max
+    {
+        for index in min..=max {
+            if index != min {
+                flags[index] |= GRAPH_WEST;
+            }
+            if index != max {
+                flags[index] |= GRAPH_EAST;
+            }
+        }
+    }
+
+    let mut prefix = String::with_capacity(columns.saturating_mul(2));
+    for column_flags in flags {
+        let (center, east) = graph_cell(column_flags);
+        prefix.push(center);
+        prefix.push(east);
+    }
+    prefix
+}
+
+fn graph_cell(flags: u8) -> (char, char) {
+    let east = if flags & GRAPH_EAST != 0 { '─' } else { ' ' };
+    if flags & GRAPH_NODE != 0 {
+        return ('*', east);
+    }
+
+    let north = flags & GRAPH_NORTH != 0;
+    let south = flags & GRAPH_SOUTH != 0;
+    let west = flags & GRAPH_WEST != 0;
+    let east_edge = flags & GRAPH_EAST != 0;
+    let center = match (north, south, east_edge, west) {
+        (true, true, false, false) => '│',
+        (true, true, true, false) => '├',
+        (true, true, false, true) => '┤',
+        (true, true, true, true) => '┼',
+        (false, false, true, true) => '─',
+        (true, false, true, false) => '└',
+        (true, false, false, true) => '┘',
+        (false, true, true, false) => '┌',
+        (false, true, false, true) => '┐',
+        (true, false, true, true) => '┴',
+        (false, true, true, true) => '┬',
+        (true, false, false, false) | (false, true, false, false) => '│',
+        (false, false, true, false) | (false, false, false, true) => '─',
+        _ => ' ',
+    };
+    (center, east)
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
         BranchStack, CommitLogEntry, CommitPicker, PickerChoice, PickerStep, ReviewTarget, Utc,
+        commit_graph_prefixes,
     };
 
     #[test]
@@ -541,6 +725,141 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graph_prefix_links_a_child_to_its_parent() {
+        let commits = vec![commit("child", Some("parent")), commit("parent", None)];
+        let prefixes = trimmed_graph(&commits);
+
+        assert_eq!(
+            prefixes,
+            vec!["*", "*"],
+            "linear history must keep one star column so the child sits on its parent"
+        );
+        assert_eq!(
+            commit_graph_prefixes(&commits).len(),
+            commits.len(),
+            "every commit must keep exactly one graph row"
+        );
+    }
+
+    #[test]
+    fn merge_history_renders_distinct_tree_lines() {
+        let commits = vec![
+            commit_with_parents("merge", &["main", "side"]),
+            commit("side", Some("main")),
+            commit("main", None),
+        ];
+        let prefixes = trimmed_graph(&commits);
+
+        assert_eq!(
+            prefixes,
+            vec!["*─┐", "├─*", "*"],
+            "a merge must open a second lane for the side parent, then rejoin at main"
+        );
+        assert_ne!(
+            prefixes[0], prefixes[1],
+            "the merge commit and its side parent must not share a flat list row"
+        );
+        assert!(
+            prefixes.iter().all(|prefix| prefix.contains('*')),
+            "each selectable row must include the commit node, not a decoration-only connector"
+        );
+
+        let with_first_parent = vec![
+            commit_with_parents("merge", &["mainline", "side"]),
+            commit("mainline", Some("root")),
+            commit("side", Some("root")),
+            commit("root", None),
+        ];
+        assert_eq!(
+            trimmed_graph(&with_first_parent),
+            vec!["*─┐", "* │", "├─*", "*"],
+            "the first-parent chain must keep the left lane while the side commit hangs off it"
+        );
+    }
+
+    #[test]
+    fn selecting_a_tree_row_maps_to_the_commit_sha() {
+        let mut picker = CommitPicker::new(
+            vec![
+                commit_with_parents("merge", &["main", "side"]),
+                commit("side", Some("main")),
+                commit("main", None),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            picker.item_count(),
+            3,
+            "the tree must not insert decoration-only rows between commits"
+        );
+        assert_eq!(
+            picker.graph_prefixes.len(),
+            picker.commits.len(),
+            "graph prefixes must stay aligned with commit indices"
+        );
+
+        picker.handle_key(key(KeyCode::Char('j')));
+        assert!(
+            picker.handle_key(key(KeyCode::Enter)).is_none(),
+            "choosing the side-branch row must open the base picker"
+        );
+        let PickerStep::Base { source, selected } = picker.step else {
+            panic!("choosing a tree row must open the base picker");
+        };
+        assert_eq!(
+            picker.commits[source].sha, "side",
+            "j/k must select the side commit, not a graph decoration"
+        );
+        assert_eq!(
+            picker.commits[selected].sha, "main",
+            "the base picker must still preselect the chosen commit's first parent"
+        );
+
+        match picker.handle_key(key(KeyCode::Enter)) {
+            Some(PickerChoice::Review(ReviewTarget {
+                base_sha,
+                source_sha,
+            })) => {
+                assert_eq!(source_sha, "side");
+                assert_eq!(base_sha, "main");
+            }
+            other => panic!("expected a commit range review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_shortcut_stays_above_the_commit_tree() {
+        let picker = CommitPicker::new(
+            vec![
+                commit_with_parents("merge", &["main", "side"]),
+                commit("side", Some("main")),
+                commit("main", None),
+            ],
+            Some(stack("origin/main", "main", "merge", 3)),
+        );
+
+        assert_eq!(
+            picker.item_count(),
+            4,
+            "the branch shortcut must remain a header row above the tree"
+        );
+        assert!(
+            matches!(picker.source_row(0), super::SourceRow::Branch),
+            "row 0 must stay the branch-stack shortcut, not a fake commit node"
+        );
+        assert!(
+            matches!(picker.source_row(2), super::SourceRow::Commit(1)),
+            "tree rows under the shortcut must still map to commit indices"
+        );
+        assert_eq!(
+            trimmed_graph(&picker.commits),
+            vec!["*─┐", "├─*", "*"],
+            "the commit tree must keep merge geometry under the shortcut row"
+        );
+    }
+
     fn stack(mainline: &str, merge_base: &str, head: &str, commit_count: usize) -> BranchStack {
         BranchStack {
             mainline: mainline.to_owned(),
@@ -551,14 +870,25 @@ mod tests {
     }
 
     fn commit(sha: &str, first_parent_sha: Option<&str>) -> CommitLogEntry {
+        commit_with_parents(sha, first_parent_sha.as_slice())
+    }
+
+    fn commit_with_parents(sha: &str, parents: &[&str]) -> CommitLogEntry {
         CommitLogEntry {
             sha: sha.to_owned(),
             short_sha: sha.to_owned(),
-            first_parent_sha: first_parent_sha.map(str::to_owned),
+            parent_shas: parents.iter().map(|parent| (*parent).to_owned()).collect(),
             subject: sha.to_owned(),
             committed_at: Utc::now(),
             unpushed: false,
         }
+    }
+
+    fn trimmed_graph(commits: &[CommitLogEntry]) -> Vec<String> {
+        commit_graph_prefixes(commits)
+            .into_iter()
+            .map(|prefix| prefix.trim_end().to_owned())
+            .collect()
     }
 
     fn key(code: KeyCode) -> KeyEvent {
