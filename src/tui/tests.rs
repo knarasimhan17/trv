@@ -7,6 +7,7 @@ use crate::diff::{ParsedDiff, SideBySideRow};
 use crate::model::{Comment, Side};
 use crate::session::{FrozenReview, LiveReview, ReviewSession, ViewKind};
 
+use super::diff_view::{item_index_at, item_top};
 use super::{App, DiffLayout, DiffRow, Mode, ReviewOutcome, dock_bottom, footer_text, render};
 
 const LIVE_DIFF: &str = "\
@@ -446,6 +447,209 @@ diff --git file.rs file.rs
         matches!(app.mode, Mode::CommentInput { .. }),
         "clicking an added or deleted line must open the comment box"
     );
+}
+
+const WRAPPED_ADDITION: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+fn wrapped_addition_diff() -> String {
+    format!(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,2 +1,2 @@
+-old
++{WRAPPED_ADDITION}
+ keep
+"
+    )
+}
+
+fn wrapped_context_diff() -> String {
+    format!(
+        "\
+diff --git file.rs file.rs
+--- file.rs
++++ file.rs
+@@ -1,2 +1,2 @@
+ {WRAPPED_ADDITION}
+ {WRAPPED_ADDITION}-two
+"
+    )
+}
+
+fn render_review(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, app))
+        .expect("review must render");
+    buffer_rows(terminal.backend().buffer())
+}
+
+fn wrapped_item_continuation(app: &App, index: usize) -> u16 {
+    assert!(
+        *app.diff_list
+            .heights
+            .get(index)
+            .expect("the wrapped item must have a recorded height")
+            >= 2,
+        "the source line must occupy more than one visual row, heights={:?}",
+        app.diff_list.heights
+    );
+    let top = item_top(
+        app.diff_list.inner,
+        &app.diff_list.heights,
+        app.diff_list.offset,
+        index,
+    )
+    .expect("the wrapped item must be on screen");
+    let continuation = top + 1;
+    assert_eq!(
+        item_index_at(
+            app.diff_list.inner,
+            &app.diff_list.heights,
+            app.diff_list.offset,
+            continuation,
+        ),
+        Some(index),
+        "a wrapped continuation row must map back to the same diff item"
+    );
+    continuation
+}
+
+#[test]
+fn clicking_a_wrapped_continuation_comments_on_the_source_line() {
+    let mut app = App::new(ParsedDiff::parse(&wrapped_addition_diff()));
+    let addition = row_with_text(&app, WRAPPED_ADDITION);
+    let rows = render_review(&mut app, 40, 16);
+    let continuation = wrapped_item_continuation(&app, addition);
+
+    app.handle_mouse(click(8, continuation));
+
+    assert_eq!(
+        app.selected_anchor()
+            .map(|anchor| (anchor.path.as_str(), anchor.line, anchor.side)),
+        Some(("file.rs", 1, Side::New)),
+        "clicking a wrapped continuation must comment on the original source line, got {:?} from {rows:?}",
+        app.selected_anchor()
+    );
+    let Mode::CommentInput {
+        anchor,
+        end_line,
+        existing,
+        ..
+    } = &app.mode
+    else {
+        panic!("clicking a wrapped addition continuation must open a comment");
+    };
+    assert_eq!(anchor.line, 1);
+    assert_eq!(*end_line, 1);
+    assert_eq!(*existing, None);
+}
+
+#[test]
+fn c_on_a_wrapped_continuation_comments_on_the_source_line() {
+    let mut app = App::new(ParsedDiff::parse(&wrapped_context_diff()));
+    let first = row_with_text(&app, WRAPPED_ADDITION);
+    let rows = render_review(&mut app, 40, 16);
+    let continuation = wrapped_item_continuation(&app, first);
+
+    app.handle_mouse(click(8, continuation));
+    assert!(
+        matches!(app.mode, Mode::Diff),
+        "clicking a wrapped context continuation must select it without opening a comment"
+    );
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+    let Mode::CommentInput {
+        anchor, end_line, ..
+    } = &app.mode
+    else {
+        panic!(
+            "c on a wrapped continuation must open a comment on that source line, got {:?} from {rows:?}",
+            app.selected_anchor()
+        );
+    };
+    assert_eq!(
+        (anchor.path.as_str(), anchor.line, anchor.side, *end_line),
+        ("file.rs", 1, Side::New, 1)
+    );
+}
+
+#[test]
+fn visual_range_can_end_on_a_wrapped_continuation_row() {
+    let mut app = App::new(ParsedDiff::parse(&wrapped_context_diff()));
+    let first = row_with_text(&app, WRAPPED_ADDITION);
+    let second = row_with_text(&app, &format!("{WRAPPED_ADDITION}-two"));
+    let rows = render_review(&mut app, 40, 16);
+    let start = wrapped_item_continuation(&app, first);
+    let end = wrapped_item_continuation(&app, second);
+
+    app.handle_mouse(click(8, start));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    app.handle_mouse(click(8, end));
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    save_open_comment(&mut app, "cover both wrapped lines");
+
+    assert_eq!(
+        app.comments
+            .iter()
+            .map(|comment| comment.location())
+            .collect::<Vec<_>>(),
+        ["file.rs:1-2"],
+        "a visual range that starts or ends on a continuation must still use the source lines, got {rows:?}"
+    );
+}
+
+#[test]
+fn clicking_a_wrapped_continuation_does_not_edit_an_inline_comment() {
+    let mut app = App::new(ParsedDiff::parse(&wrapped_addition_diff()));
+    let addition = row_with_text(&app, WRAPPED_ADDITION);
+    app.select_diff(addition);
+    app.start_comment();
+    save_open_comment(&mut app, "keep");
+
+    let rows = render_review(&mut app, 40, 16);
+    let continuation = wrapped_item_continuation(&app, addition);
+    app.handle_mouse(click(8, continuation));
+
+    let Mode::CommentInput { existing, .. } = &app.mode else {
+        panic!("clicking a wrapped source continuation must open a new comment, got {rows:?}");
+    };
+    assert_eq!(
+        *existing, None,
+        "a continuation row must not be treated as the inline comment beneath it"
+    );
+}
+
+#[test]
+fn j_moves_by_source_line_across_wrapped_visual_rows() {
+    let mut app = App::new(ParsedDiff::parse(&wrapped_addition_diff()));
+    let addition = row_with_text(&app, WRAPPED_ADDITION);
+    let keep = row_with_text(&app, "keep");
+    render_review(&mut app, 40, 16);
+    assert!(
+        app.diff_list.heights[addition] >= 2,
+        "the added line must wrap so j has visual continuation rows to skip"
+    );
+
+    app.select_diff(addition);
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+    assert_eq!(
+        app.selected_diff, keep,
+        "j must move to the next source line, not a display-only wrap row"
+    );
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(
+        app.selected_diff, addition,
+        "k must return to the wrapped source line as a single selectable item"
+    );
+    app.handle_diff_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    let Mode::CommentInput { anchor, .. } = &app.mode else {
+        panic!("c on a wrapped source line must open a comment");
+    };
+    assert_eq!(anchor.line, 1);
 }
 
 #[test]
