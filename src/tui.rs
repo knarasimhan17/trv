@@ -1,6 +1,7 @@
 mod bindings;
 mod comment_input;
 mod diff_view;
+mod file_tree;
 mod picker;
 mod review;
 
@@ -95,6 +96,11 @@ struct App {
     status: Option<String>,
     help: bool,
     diff_list: DiffListLayout,
+    file_tree_visible: bool,
+    file_tree_focused: bool,
+    selected_file: usize,
+    file_tree_list: DiffListLayout,
+    file_tree_area: Rect,
     submit_on_quit: bool,
 }
 
@@ -147,6 +153,11 @@ impl App {
             status: None,
             help: false,
             diff_list: DiffListLayout::default(),
+            file_tree_visible: false,
+            file_tree_focused: false,
+            selected_file: 0,
+            file_tree_list: DiffListLayout::default(),
+            file_tree_area: Rect::default(),
             submit_on_quit: false,
         };
         app.load_view();
@@ -205,7 +216,11 @@ impl App {
         self.selected_diff = 0;
         self.selected_side = Side::New;
         self.selected_comment = 0;
+        self.selected_file = 0;
+        self.file_tree_focused = false;
         self.diff_list = DiffListLayout::default();
+        self.file_tree_list = DiffListLayout::default();
+        self.file_tree_area = Rect::default();
         self.visual = None;
         self.mode = Mode::Diff;
         self.rev_picker = None;
@@ -295,7 +310,11 @@ impl App {
         }
 
         if matches!(self.mode, Mode::Diff) {
-            self.handle_diff_key(key)
+            if self.file_tree_focused {
+                self.handle_file_tree_key(key)
+            } else {
+                self.handle_diff_key(key)
+            }
         } else if matches!(self.mode, Mode::Comments) {
             self.handle_comments_key(key)
         } else if matches!(self.mode, Mode::CommentInput { .. }) {
@@ -382,10 +401,29 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.select_at_pointer(mouse.column, mouse.row);
+                if self.file_tree_visible
+                    && file_tree::contains(self.file_tree_area, mouse.column, mouse.row)
+                {
+                    self.select_file_at_pointer(mouse.row);
+                } else {
+                    self.file_tree_focused = false;
+                    self.select_at_pointer(mouse.column, mouse.row);
+                }
             }
-            MouseEventKind::ScrollDown => self.move_diff_down(),
-            MouseEventKind::ScrollUp => self.move_diff_up(),
+            MouseEventKind::ScrollDown => {
+                if self.file_tree_focused {
+                    self.move_file_tree(true);
+                } else {
+                    self.move_diff_down();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.file_tree_focused {
+                    self.move_file_tree(false);
+                } else {
+                    self.move_diff_up();
+                }
+            }
             _ => {}
         }
     }
@@ -467,6 +505,7 @@ impl App {
                 };
                 self.status = Some(format!("Inline comments {state}."));
             }
+            bindings::ReviewAction::ToggleFileTree => self.toggle_file_tree(),
             bindings::ReviewAction::Export => return self.export_comments(),
             bindings::ReviewAction::Cancel => {
                 if !self.cancel_visual() {
@@ -475,8 +514,55 @@ impl App {
             }
             bindings::ReviewAction::Quit => return self.request_quit(),
             bindings::ReviewAction::Help => self.help = true,
-            bindings::ReviewAction::ReturnToDiff => {
-                unreachable!("diff keymap cannot contain comment-list actions")
+            bindings::ReviewAction::ReturnToDiff | bindings::ReviewAction::ActivateFile => {
+                unreachable!("diff keymap cannot contain file-list actions")
+            }
+        }
+        None
+    }
+
+    fn handle_file_tree_key(&mut self, key: KeyEvent) -> Option<ReviewOutcome> {
+        let action = bindings::action_for(
+            bindings::review_bindings(bindings::ReviewContext::FileTree),
+            &key,
+        )?;
+        match action {
+            bindings::ReviewAction::MoveDown => self.move_file_tree(true),
+            bindings::ReviewAction::MoveUp => self.move_file_tree(false),
+            bindings::ReviewAction::First => self.select_file_tree(0),
+            bindings::ReviewAction::Last => {
+                self.select_file_tree(self.diff.files.len().saturating_sub(1))
+            }
+            bindings::ReviewAction::NextFile => {
+                if self.visual.is_none() {
+                    self.next_file();
+                }
+            }
+            bindings::ReviewAction::PreviousFile => {
+                if self.visual.is_none() {
+                    self.previous_file();
+                }
+            }
+            bindings::ReviewAction::ActivateFile => self.activate_file_tree_row(),
+            bindings::ReviewAction::ToggleFileTree => self.toggle_file_tree(),
+            bindings::ReviewAction::ReturnToDiff => self.unfocus_file_tree(),
+            bindings::ReviewAction::OpenRevisions => self.open_rev_picker(),
+            bindings::ReviewAction::Export => return self.export_comments(),
+            bindings::ReviewAction::Quit => return self.request_quit(),
+            bindings::ReviewAction::Help => self.help = true,
+            bindings::ReviewAction::SelectOld
+            | bindings::ReviewAction::SelectNew
+            | bindings::ReviewAction::ToggleFile
+            | bindings::ReviewAction::ToggleFileOrComments
+            | bindings::ReviewAction::AddComment
+            | bindings::ReviewAction::EditComment
+            | bindings::ReviewAction::DeleteComment
+            | bindings::ReviewAction::OpenComments
+            | bindings::ReviewAction::StartVisual
+            | bindings::ReviewAction::ToggleInlineComments
+            | bindings::ReviewAction::ToggleLayout
+            | bindings::ReviewAction::Cancel => {
+                unreachable!("file-list keymap cannot contain diff actions")
             }
         }
         None
@@ -520,6 +606,8 @@ impl App {
             | bindings::ReviewAction::SelectNew
             | bindings::ReviewAction::ToggleFile
             | bindings::ReviewAction::ToggleFileOrComments
+            | bindings::ReviewAction::ToggleFileTree
+            | bindings::ReviewAction::ActivateFile
             | bindings::ReviewAction::AddComment
             | bindings::ReviewAction::OpenComments
             | bindings::ReviewAction::StartVisual
@@ -533,6 +621,9 @@ impl App {
     }
 
     fn review_context(&self) -> bindings::ReviewContext {
+        if self.file_tree_focused && self.visible_view() == View::Diff {
+            return bindings::ReviewContext::FileTree;
+        }
         match self.visible_view() {
             View::Comments => bindings::ReviewContext::Comments,
             View::Diff if self.diff_layout == DiffLayout::Unified => {
@@ -777,8 +868,22 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
     let selected_row = match app.visible_view() {
-        View::Diff => diff_view::render(frame, content, app),
+        View::Diff => {
+            let diff_area = if app.file_tree_visible {
+                let width = file_tree::panel_width(content.width);
+                let [tree_area, rest] =
+                    Layout::horizontal([Constraint::Length(width), Constraint::Min(1)])
+                        .areas(content);
+                file_tree::render(frame, tree_area, app);
+                rest
+            } else {
+                app.file_tree_area = Rect::default();
+                content
+            };
+            diff_view::render(frame, diff_area, app)
+        }
         View::Comments => {
+            app.file_tree_area = Rect::default();
             render_comments(frame, content, app);
             None
         }
@@ -872,9 +977,16 @@ fn footer_text(app: &App) -> String {
     let controls = match app.visible_view() {
         View::Diff => {
             let inline_state = if app.inline_comments { "on" } else { "off" };
-            if app.submit_on_quit {
+            let files_state = if app.file_tree_visible { "on" } else { "off" };
+            if app.file_tree_focused {
                 format!(
-                    "r revs | {} | q send comments | s view: {} | {}",
+                    "f files: {files_state} | Enter jump | Esc review | {} | {}",
+                    app.view_label(),
+                    bindings::HELP_HINT
+                )
+            } else if app.submit_on_quit {
+                format!(
+                    "r revs | {} | f files | q send comments | s view: {} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT
@@ -888,7 +1000,7 @@ fn footer_text(app: &App) -> String {
                 )
             } else {
                 format!(
-                    "r revs | {} | s view: {} | i inline comments: {inline_state} | {}",
+                    "r revs | {} | f files: {files_state} | s view: {} | i inline comments: {inline_state} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT

@@ -39,6 +39,7 @@ pub(super) enum ReviewContext {
     Unified,
     SideBySide,
     Comments,
+    FileTree,
 }
 
 impl ReviewContext {
@@ -47,6 +48,7 @@ impl ReviewContext {
             Self::Unified => "unified review",
             Self::SideBySide => "side-by-side review",
             Self::Comments => "comment list",
+            Self::FileTree => "file list",
         }
     }
 }
@@ -63,6 +65,8 @@ pub(super) enum ReviewAction {
     SelectNew,
     ToggleFile,
     ToggleFileOrComments,
+    ToggleFileTree,
+    ActivateFile,
     AddComment,
     EditComment,
     DeleteComment,
@@ -112,6 +116,8 @@ enum ReviewScope {
     Diff,
     SideBySide,
     Comments,
+    FileTree,
+    DiffOrFileTree,
 }
 
 impl ReviewScope {
@@ -121,6 +127,11 @@ impl ReviewScope {
             Self::Diff => matches!(context, ReviewContext::Unified | ReviewContext::SideBySide),
             Self::SideBySide => context == ReviewContext::SideBySide,
             Self::Comments => context == ReviewContext::Comments,
+            Self::FileTree => context == ReviewContext::FileTree,
+            Self::DiffOrFileTree => matches!(
+                context,
+                ReviewContext::Unified | ReviewContext::SideBySide | ReviewContext::FileTree
+            ),
         }
     }
 }
@@ -273,14 +284,14 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
         ReviewAction::Last,
     ),
     review_binding(
-        ReviewScope::Diff,
+        ReviewScope::DiffOrFileTree,
         &[plain(KeyCode::Char(']'))],
         "]",
         "Jump to the next file",
         ReviewAction::NextFile,
     ),
     review_binding(
-        ReviewScope::Diff,
+        ReviewScope::DiffOrFileTree,
         &[plain(KeyCode::Char('['))],
         "[",
         "Jump to the previous file",
@@ -306,6 +317,27 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
         "Enter",
         "Collapse or expand the selected file",
         ReviewAction::ToggleFile,
+    ),
+    review_binding(
+        ReviewScope::FileTree,
+        &[plain(KeyCode::Enter)],
+        "Enter",
+        "Jump to the selected file",
+        ReviewAction::ActivateFile,
+    ),
+    review_binding(
+        ReviewScope::DiffOrFileTree,
+        &[plain(KeyCode::Char('f'))],
+        "f",
+        "Show or hide the file list",
+        ReviewAction::ToggleFileTree,
+    ),
+    review_binding(
+        ReviewScope::FileTree,
+        &[plain(KeyCode::Esc)],
+        "Esc",
+        "Return to the review",
+        ReviewAction::ReturnToDiff,
     ),
     review_binding(
         ReviewScope::Diff,
@@ -411,7 +443,7 @@ const REVIEW_BINDINGS: &[ReviewBinding] = &[
         ReviewAction::Cancel,
     ),
     review_binding(
-        ReviewScope::Diff,
+        ReviewScope::DiffOrFileTree,
         &[plain(KeyCode::Char('q'))],
         "q",
         "Quit the review",
