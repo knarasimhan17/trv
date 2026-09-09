@@ -113,6 +113,8 @@ impl App {
             anchor,
             end_line,
             body: String::new(),
+            cursor: 0,
+            wrap_width: super::comment_input::DEFAULT_WRAP_WIDTH,
             existing: None,
         };
         self.status = None;
@@ -134,6 +136,8 @@ impl App {
             },
             end_line: comment.end_line(),
             body: comment.body.clone(),
+            cursor: comment.body.len(),
+            wrap_width: super::comment_input::DEFAULT_WRAP_WIDTH,
             existing: Some(index),
         };
         self.selected_comment = index;
