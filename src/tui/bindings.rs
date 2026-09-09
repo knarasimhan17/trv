@@ -198,7 +198,7 @@ const SOURCE_PICKER_BINDINGS: &[Binding<PickerAction>] = &[
     binding(
         &[plain(KeyCode::Enter)],
         "Enter",
-        "Review this branch, or choose a commit",
+        "Choose this source",
         PickerAction::Select,
     ),
     binding(
@@ -225,19 +225,19 @@ const BASE_PICKER_BINDINGS: &[Binding<PickerAction>] = &[
     binding(
         &[plain(KeyCode::Char('j')), plain(KeyCode::Down)],
         "j / Down",
-        "Move to the next base commit",
+        "Move to the next base",
         PickerAction::MoveDown,
     ),
     binding(
         &[plain(KeyCode::Char('k')), plain(KeyCode::Up)],
         "k / Up",
-        "Move to the previous base commit",
+        "Move to the previous base",
         PickerAction::MoveUp,
     ),
     binding(
         &[plain(KeyCode::Enter)],
         "Enter",
-        "Review the selected commit range",
+        "Review against this base",
         PickerAction::Select,
     ),
     binding(

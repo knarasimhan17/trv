@@ -81,12 +81,13 @@ fn run_review(
 ) -> Result<()> {
     let thread = repository.current_thread()?;
     let stack = repository.branch_stack()?;
+    let has_uncommitted = repository.has_uncommitted_changes()?;
     match review_launch(
         revset,
         working_tree,
         branch,
         agent,
-        repository.has_uncommitted_changes()?,
+        has_uncommitted,
         stack.is_some(),
     ) {
         ReviewLaunch::Direct { revset } => {
@@ -108,13 +109,13 @@ fn run_review(
         }
         ReviewLaunch::Picker => {
             let commits = repository.recent_commits()?;
+            let branches = repository.list_branches()?;
             let outcome = tui::run_picker(
                 commits,
                 stack,
-                |target| {
-                    let revset = format!("{}..{}", target.base_sha, target.source_sha);
-                    repository.prepare_review(Some(&revset))
-                },
+                branches,
+                has_uncommitted,
+                |target| repository.prepare_picker_target(&target),
                 |prepared| open_review_session(repository, &thread, prepared),
                 agent,
             )?;

@@ -62,9 +62,9 @@ pub(crate) fn review_launch(
         }
     } else if working_tree {
         ReviewLaunch::Direct { revset: None }
-    } else if branch || (has_branch_stack && (agent || has_uncommitted)) {
+    } else if branch || (agent && has_branch_stack) {
         ReviewLaunch::Branch
-    } else if has_uncommitted {
+    } else if agent && has_uncommitted {
         ReviewLaunch::Direct { revset: None }
     } else {
         ReviewLaunch::Picker
@@ -98,11 +98,11 @@ mod tests {
     }
 
     #[test]
-    fn dirty_working_tree_opens_uncommitted_changes() {
+    fn dirty_working_tree_opens_the_commit_picker() {
         assert_eq!(
             review_launch(None, false, false, false, true, false),
-            ReviewLaunch::Direct { revset: None },
-            "uncommitted changes on mainline must skip the commit picker"
+            ReviewLaunch::Picker,
+            "uncommitted changes on mainline must still open the picker"
         );
     }
 
@@ -145,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dirty_feature_branch_reviews_the_whole_stack() {
+    fn a_dirty_feature_branch_opens_the_picker() {
         assert_eq!(
             review_launch(None, false, false, false, true, true),
-            ReviewLaunch::Branch,
-            "uncommitted work on a feature branch must join the stack vs mainline"
+            ReviewLaunch::Picker,
+            "interactive reviews on a dirty feature branch must open the picker"
         );
     }
 
@@ -160,6 +160,11 @@ mod tests {
             ReviewLaunch::Branch,
             "--agent on a branch ahead of mainline must skip the commit picker"
         );
+        assert_eq!(
+            review_launch(None, false, false, true, true, true),
+            ReviewLaunch::Branch,
+            "--agent on a dirty feature branch must still skip the picker"
+        );
     }
 
     #[test]
@@ -168,6 +173,15 @@ mod tests {
             review_launch(None, false, false, false, false, true),
             ReviewLaunch::Picker,
             "interactive reviews on a clean feature branch must still offer the picker"
+        );
+    }
+
+    #[test]
+    fn agent_on_a_dirty_mainline_reviews_the_working_tree() {
+        assert_eq!(
+            review_launch(None, false, false, true, true, false),
+            ReviewLaunch::Direct { revset: None },
+            "--agent on a dirty mainline must not block on the picker"
         );
     }
 }

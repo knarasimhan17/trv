@@ -52,27 +52,29 @@ trv revs
 trv --agent
 ```
 
-If the current branch is ahead of mainline (`origin/main`, `origin/master`,
-`main`, …), `trv` can review the whole stack as one diff, like a GitHub pull
-request. Uncommitted work on that branch is included. `trv --agent` and a dirty
-feature branch take this path directly. On a clean feature branch, the picker
-lists **this branch vs origin/main** first as a shortcut above the commit
-graph; `Enter` reviews the combined commits. Selecting a commit still opens a
-second picker for its base, preselected to the commit's first parent. Both
-steps draw the same parent/child tree.
+Interactive `trv` always opens a two-step picker, including on a dirty feature
+branch. Both steps draw a parent/child commit tree like `git log --graph`.
+The source step lists the latest 200 commits on the current branch
+(HEAD is selected by default), uncommitted work when the tree is dirty, and a
+**this branch** row when HEAD is ahead of mainline (`origin/main`,
+`origin/master`, `main`, …). The whole-branch row is available but is not the
+default. Commits not found on any remote-tracking ref are marked as unpushed.
 
-If the working tree has uncommitted changes on mainline, `trv` reviews them
-against `HEAD` directly. If the working tree is clean and HEAD is not ahead of
-mainline, it opens a graph-style picker of the latest 200 commits on the
-current branch, using parent links like `git log --graph`. Commits not found
-on any remote-tracking ref are marked as unpushed.
+After you choose a source, the base step selects what to review it against.
+The default is the source's first parent (or HEAD for uncommitted work, or
+detected mainline for the whole-branch row). You can also pick another commit
+on the branch or another local / remote-tracking branch, so a single commit
+vs `main` and this branch vs another branch are both possible. A branch base
+uses the merge base of that branch and the source, like a pull request.
 
-`trv -b` (or `trv --branch`) reviews the current branch against mainline
-directly, including uncommitted changes. `trv -w` (or `trv --working-tree`)
-reviews the current working tree against `HEAD` only, even when it is clean.
-`trv -r <revset>` reviews a commit or revision range directly. These flags skip
-the picker. Exporting comments creates the next immutable revision for the
-current repository and branch.
+`trv -b` (or `trv --branch`) skips the picker and reviews the current branch
+against mainline directly, including uncommitted changes. `trv -w` (or
+`trv --working-tree`) reviews the current working tree against `HEAD` only,
+even when it is clean. `trv -r <revset>` reviews a commit or revision range
+directly. `trv --agent` also skips the picker when the branch is ahead of
+mainline and reviews that whole stack (every commit plus uncommitted work)
+against mainline. Exporting comments creates the next immutable revision for
+the current repository and branch.
 
 `trv revs` lists the stored revisions.
 

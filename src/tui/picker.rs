@@ -10,16 +10,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::git::{BranchStack, CommitLogEntry, PreparedReview};
+use crate::git::{
+    BranchRef, BranchStack, CommitLogEntry, PreparedReview, ReviewBase, ReviewSource, ReviewTarget,
+};
 use crate::session::ReviewSession;
 
 use super::{ReviewOutcome, TrvTerminal, bindings, run_review, with_terminal};
-
-#[derive(Debug)]
-pub(crate) struct ReviewTarget {
-    pub(crate) base_sha: String,
-    pub(crate) source_sha: String,
-}
 
 pub(crate) enum CommitPickerOutcome {
     Reviewed {
@@ -29,40 +25,64 @@ pub(crate) enum CommitPickerOutcome {
     Quit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum PickerChoice {
     Review(ReviewTarget),
     Quit,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerStep {
     Source { selected: usize },
-    Base { source: usize, selected: usize },
+    Base { source: SourceRow, selected: usize },
 }
 
 struct CommitPicker {
     branch: Option<BranchStack>,
+    branches: Vec<BranchRef>,
     commits: Vec<CommitLogEntry>,
     graph_prefixes: Vec<String>,
+    dirty: bool,
     step: PickerStep,
     now: DateTime<Utc>,
     help: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceRow {
-    Branch,
+    WorkingTree,
     Commit(usize),
+    Branch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseRow {
+    Commit(usize),
+    Branch(usize),
 }
 
 impl CommitPicker {
-    fn new(commits: Vec<CommitLogEntry>, branch: Option<BranchStack>) -> Self {
+    fn new(
+        commits: Vec<CommitLogEntry>,
+        branch: Option<BranchStack>,
+        mut branches: Vec<BranchRef>,
+        dirty: bool,
+    ) -> Self {
+        if let Some(mainline) = branch.as_ref().map(|stack| stack.mainline.as_str())
+            && let Some(index) = branches.iter().position(|branch| branch.name == mainline)
+        {
+            let mainline = branches.remove(index);
+            branches.insert(0, mainline);
+        }
         let graph_prefixes = commit_graph_prefixes(&commits);
+        let selected = default_source_selected(dirty, commits.len());
         Self {
             branch,
+            branches,
             commits,
             graph_prefixes,
-            step: PickerStep::Source { selected: 0 },
+            dirty,
+            step: PickerStep::Source { selected },
             now: Utc::now(),
             help: false,
         }
@@ -113,48 +133,16 @@ impl CommitPicker {
 
     fn select(&mut self) -> Option<PickerChoice> {
         match self.step {
-            PickerStep::Source { selected } => match self.source_row(selected) {
-                SourceRow::Branch => {
-                    let branch = self
-                        .branch
-                        .as_ref()
-                        .expect("the branch row requires a detected stack");
-                    Some(PickerChoice::Review(ReviewTarget {
-                        base_sha: branch.merge_base_sha.clone(),
-                        source_sha: branch.head_sha.clone(),
-                    }))
-                }
-                SourceRow::Commit(index) => {
-                    let commit = self
-                        .commits
-                        .get(index)
-                        .expect("source picker index must be bounded by the commit list");
-                    let base = commit
-                        .first_parent_sha()
-                        .and_then(|parent| {
-                            self.commits.iter().position(|commit| commit.sha == parent)
-                        })
-                        .unwrap_or(index);
-                    self.step = PickerStep::Base {
-                        source: index,
-                        selected: base,
-                    };
-                    None
-                }
-            },
+            PickerStep::Source { selected } => {
+                let source = self.source_row(selected);
+                self.step = PickerStep::Base {
+                    source,
+                    selected: self.default_base_selected(source),
+                };
+                None
+            }
             PickerStep::Base { source, selected } => {
-                let source = self
-                    .commits
-                    .get(source)
-                    .expect("base picker source index must be bounded by the commit list");
-                let base = self
-                    .commits
-                    .get(selected)
-                    .expect("base picker selection must be bounded by the commit list");
-                Some(PickerChoice::Review(ReviewTarget {
-                    base_sha: base.sha.clone(),
-                    source_sha: source.sha.clone(),
-                }))
+                Some(PickerChoice::Review(self.review_target(source, selected)))
             }
         }
     }
@@ -163,7 +151,9 @@ impl CommitPicker {
         match self.step {
             PickerStep::Source { .. } => Some(PickerChoice::Quit),
             PickerStep::Base { source, .. } => {
-                self.step = PickerStep::Source { selected: source };
+                self.step = PickerStep::Source {
+                    selected: self.source_index(source),
+                };
                 None
             }
         }
@@ -171,17 +161,134 @@ impl CommitPicker {
 
     fn item_count(&self) -> usize {
         match self.step {
-            PickerStep::Source { .. } => self.commits.len() + usize::from(self.branch.is_some()),
-            PickerStep::Base { .. } => self.commits.len(),
+            PickerStep::Source { .. } => {
+                usize::from(self.dirty) + self.commits.len() + usize::from(self.branch.is_some())
+            }
+            PickerStep::Base { source, .. } => self.base_rows(source).len(),
         }
     }
 
     fn source_row(&self, selected: usize) -> SourceRow {
-        match &self.branch {
-            Some(_) if selected == 0 => SourceRow::Branch,
-            Some(_) => SourceRow::Commit(selected - 1),
-            None => SourceRow::Commit(selected),
+        let mut index = selected;
+        if self.dirty {
+            if index == 0 {
+                return SourceRow::WorkingTree;
+            }
+            index -= 1;
         }
+        if index < self.commits.len() {
+            return SourceRow::Commit(index);
+        }
+        SourceRow::Branch
+    }
+
+    fn source_index(&self, source: SourceRow) -> usize {
+        match source {
+            SourceRow::WorkingTree => 0,
+            SourceRow::Commit(index) => usize::from(self.dirty) + index,
+            SourceRow::Branch => usize::from(self.dirty) + self.commits.len(),
+        }
+    }
+
+    fn base_rows(&self, source: SourceRow) -> Vec<BaseRow> {
+        let commit_rows = (0..self.commits.len()).map(BaseRow::Commit);
+        let branch_rows = self
+            .branches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, branch)| {
+                if matches!(source, SourceRow::Branch)
+                    && self
+                        .branch
+                        .as_ref()
+                        .is_some_and(|stack| stack.head_sha == branch.sha)
+                {
+                    return None;
+                }
+                Some(BaseRow::Branch(index))
+            });
+        match source {
+            SourceRow::Branch => branch_rows.chain(commit_rows).collect(),
+            SourceRow::WorkingTree | SourceRow::Commit(_) => {
+                commit_rows.chain(branch_rows).collect()
+            }
+        }
+    }
+
+    fn default_base_selected(&self, source: SourceRow) -> usize {
+        let rows = self.base_rows(source);
+        let wanted = match source {
+            SourceRow::Commit(index) => {
+                let parent = self
+                    .commits
+                    .get(index)
+                    .and_then(|commit| commit.first_parent_sha())
+                    .and_then(|parent| self.commits.iter().position(|commit| commit.sha == parent))
+                    .unwrap_or(index);
+                BaseRow::Commit(parent)
+            }
+            SourceRow::WorkingTree => BaseRow::Commit(0),
+            SourceRow::Branch => {
+                let mainline = self.branch.as_ref().map(|stack| stack.mainline.as_str());
+                if let Some(index) = self
+                    .branches
+                    .iter()
+                    .position(|branch| Some(branch.name.as_str()) == mainline)
+                {
+                    BaseRow::Branch(index)
+                } else {
+                    return 0;
+                }
+            }
+        };
+        rows.iter().position(|row| *row == wanted).unwrap_or(0)
+    }
+
+    fn review_target(&self, source: SourceRow, selected: usize) -> ReviewTarget {
+        let base = match self.base_row(source, selected) {
+            BaseRow::Commit(index) => ReviewBase::Commit(
+                self.commits
+                    .get(index)
+                    .expect("base picker selection must be bounded by the commit list")
+                    .sha
+                    .clone(),
+            ),
+            BaseRow::Branch(index) => {
+                let branch = self
+                    .branches
+                    .get(index)
+                    .expect("base picker selection must be bounded by the branch list");
+                ReviewBase::Branch {
+                    name: branch.name.clone(),
+                    tip_sha: branch.sha.clone(),
+                }
+            }
+        };
+        let source = match source {
+            SourceRow::WorkingTree => ReviewSource::WorkingTree,
+            SourceRow::Commit(index) => ReviewSource::Commit(
+                self.commits
+                    .get(index)
+                    .expect("source picker index must be bounded by the commit list")
+                    .sha
+                    .clone(),
+            ),
+            SourceRow::Branch => ReviewSource::Commit(
+                self.branch
+                    .as_ref()
+                    .expect("the branch row requires a detected stack")
+                    .head_sha
+                    .clone(),
+            ),
+        };
+        ReviewTarget { base, source }
+    }
+
+    fn base_row(&self, source: SourceRow, selected: usize) -> BaseRow {
+        let rows = self.base_rows(source);
+        rows.get(selected)
+            .copied()
+            .expect("base picker selection must be bounded by the base list")
     }
 
     fn selected(&self) -> usize {
@@ -205,15 +312,21 @@ impl CommitPicker {
     }
 }
 
+fn default_source_selected(dirty: bool, commit_count: usize) -> usize {
+    if dirty && commit_count > 0 { 1 } else { 0 }
+}
+
 pub(crate) fn run(
     commits: Vec<CommitLogEntry>,
     branch: Option<BranchStack>,
+    branches: Vec<BranchRef>,
+    dirty: bool,
     prepare: impl FnOnce(ReviewTarget) -> Result<PreparedReview>,
     into_session: impl FnOnce(&PreparedReview) -> Result<ReviewSession>,
     submit_on_quit: bool,
 ) -> Result<CommitPickerOutcome> {
     with_terminal(move |terminal| {
-        let mut picker = CommitPicker::new(commits, branch);
+        let mut picker = CommitPicker::new(commits, branch, branches, dirty);
         match choose_review_target(terminal, &mut picker)? {
             PickerChoice::Review(target) => {
                 let prepared = prepare(target)?;
@@ -249,20 +362,41 @@ fn render(frame: &mut Frame<'_>, picker: &CommitPicker) {
     let (title, items) = match picker.step {
         PickerStep::Source { .. } => {
             let mut items = Vec::new();
+            if picker.dirty {
+                items.push(working_tree_item());
+            }
+            items.extend(picker.commit_items(area.width));
             if let Some(branch) = &picker.branch {
                 items.push(branch_item(branch));
             }
-            items.extend(picker.commit_items(area.width));
             (" trv | select review ".to_owned(), items)
         }
         PickerStep::Base { source, .. } => {
-            let source = picker
-                .commits
-                .get(source)
-                .expect("base picker source index must be bounded by the commit list");
-            let items = picker.commit_items(area.width);
+            let items = picker
+                .base_rows(source)
+                .into_iter()
+                .map(|row| match row {
+                    BaseRow::Commit(index) => commit_item(
+                        picker.commits.get(index).expect(
+                            "base picker commit index must be bounded by the commit list",
+                        ),
+                        picker
+                            .graph_prefixes
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                        &picker.now,
+                        area.width,
+                    ),
+                    BaseRow::Branch(index) => branch_ref_item(
+                        picker.branches.get(index).expect(
+                            "base picker branch index must be bounded by the branch list",
+                        ),
+                    ),
+                })
+                .collect();
             (
-                format!(" trv | select base for {} ", source.short_sha),
+                format!(" trv | select base for {} ", source_label(picker, source)),
                 items,
             )
         }
@@ -293,6 +427,31 @@ fn render(frame: &mut Frame<'_>, picker: &CommitPicker) {
     }
 }
 
+fn source_label(picker: &CommitPicker, source: SourceRow) -> String {
+    match source {
+        SourceRow::WorkingTree => "uncommitted".to_owned(),
+        SourceRow::Commit(index) => picker
+            .commits
+            .get(index)
+            .expect("base picker source index must be bounded by the commit list")
+            .short_sha
+            .clone(),
+        SourceRow::Branch => "this branch".to_owned(),
+    }
+}
+
+fn working_tree_item() -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            "uncommitted  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("working tree"),
+    ]))
+}
+
 fn branch_item(branch: &BranchStack) -> ListItem<'static> {
     let commits = if branch.commit_count == 1 {
         "1 commit".to_owned()
@@ -306,7 +465,19 @@ fn branch_item(branch: &BranchStack) -> ListItem<'static> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("vs {}  {commits}", branch.mainline)),
+        Span::raw(format!("{commits} since {}", branch.mainline)),
+    ]))
+}
+
+fn branch_ref_item(branch: &BranchRef) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{}  ", branch.name),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("branch"),
     ]))
 }
 
@@ -575,16 +746,17 @@ fn graph_cell(flags: u8) -> (char, char) {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        BranchStack, CommitLogEntry, CommitPicker, PickerChoice, PickerStep, ReviewTarget, Utc,
-        commit_graph_prefixes,
+        BaseRow, BranchRef, BranchStack, CommitLogEntry, CommitPicker, PickerChoice, PickerStep,
+        ReviewBase, ReviewSource, ReviewTarget, SourceRow, commit_graph_prefixes,
     };
 
     #[test]
     fn source_picker_lists_only_commits() {
-        let picker = CommitPicker::new(
+        let picker = picker(
             vec![commit("source", Some("parent")), commit("parent", None)],
             None,
         );
@@ -598,11 +770,15 @@ mod tests {
             matches!(picker.step, PickerStep::Source { selected: 0 }),
             "the first commit must be selected by default"
         );
+        assert!(
+            matches!(picker.source_row(0), SourceRow::Commit(0)),
+            "the default source must be HEAD, not a branch row"
+        );
     }
 
     #[test]
     fn selecting_a_commit_reviews_it_against_its_parent() {
-        let mut picker = CommitPicker::new(
+        let mut picker = picker(
             vec![commit("source", Some("parent")), commit("parent", None)],
             None,
         );
@@ -611,33 +787,31 @@ mod tests {
             picker.handle_key(key(KeyCode::Enter)).is_none(),
             "choosing a source commit must open the base picker"
         );
-        assert!(
-            matches!(
-                picker.step,
-                PickerStep::Base {
-                    source: 0,
-                    selected: 1
-                }
-            ),
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::Commit(0),
+                selected: 1
+            },
             "the base picker must preselect the source commit's parent"
         );
 
-        match picker.handle_key(key(KeyCode::Enter)) {
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
             Some(PickerChoice::Review(ReviewTarget {
-                base_sha,
-                source_sha,
-            })) => {
-                assert_eq!(source_sha, "source");
-                assert_eq!(base_sha, "parent");
-            }
-            other => panic!("expected a commit range review, got {other:?}"),
-        }
+                base: ReviewBase::Commit("parent".to_owned()),
+                source: ReviewSource::Commit("source".to_owned()),
+            })),
+            "confirming the parent must review that commit range"
+        );
     }
 
     #[test]
     fn help_closes_without_changing_either_picker_step() {
-        let commits = vec![commit("source", Some("parent")), commit("parent", None)];
-        let mut picker = CommitPicker::new(commits, None);
+        let mut picker = picker(
+            vec![commit("source", Some("parent")), commit("parent", None)],
+            None,
+        );
 
         for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
             picker.handle_key(key(KeyCode::Char('?')));
@@ -652,77 +826,206 @@ mod tests {
         }
 
         picker.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(
-                picker.step,
-                PickerStep::Base {
-                    source: 0,
-                    selected: 1
-                }
-            ),
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::Commit(0),
+                selected: 1
+            },
             "selecting a commit must open its parent in the base picker"
         );
 
         picker.handle_key(key(KeyCode::Char('?')));
         picker.handle_key(key(KeyCode::Up));
         picker.handle_key(key(KeyCode::Char('q')));
-        assert!(
-            matches!(
-                picker.step,
-                PickerStep::Base {
-                    source: 0,
-                    selected: 1
-                }
-            ),
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::Commit(0),
+                selected: 1
+            },
             "closing help must preserve the base picker selection"
         );
     }
 
     #[test]
-    fn source_picker_puts_the_branch_stack_first() {
+    fn source_picker_defaults_to_head_not_the_branch_row() {
         let mut picker = CommitPicker::new(
             vec![commit("source", Some("parent")), commit("parent", None)],
             Some(stack("origin/main", "parent", "source", 2)),
+            vec![branch_ref("origin/main", "parent-tip")],
+            false,
         );
 
         assert_eq!(
             picker.item_count(),
             3,
-            "the source picker must list this branch above individual commits"
+            "the source picker must list commits and the whole-branch row"
         );
-        match picker.handle_key(key(KeyCode::Enter)) {
-            Some(PickerChoice::Review(ReviewTarget {
-                base_sha,
-                source_sha,
-            })) => {
-                assert_eq!(base_sha, "parent");
-                assert_eq!(source_sha, "source");
-            }
-            other => panic!("expected an immediate branch review, got {other:?}"),
-        }
+        assert!(
+            matches!(picker.step, PickerStep::Source { selected: 0 }),
+            "HEAD must be selected by default"
+        );
+        assert!(
+            matches!(picker.source_row(0), SourceRow::Commit(0)),
+            "the first selected row must be the latest commit, not this branch vs mainline"
+        );
+        assert!(
+            matches!(picker.source_row(2), SourceRow::Branch),
+            "the whole-branch option must remain selectable after the commits"
+        );
+
+        assert!(
+            picker.handle_key(key(KeyCode::Enter)).is_none(),
+            "the default HEAD row must open the base picker rather than reviewing the stack"
+        );
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::Commit(0),
+                selected: 1
+            },
+            "HEAD must still default to its first parent as the base"
+        );
     }
 
     #[test]
-    fn selecting_a_commit_below_the_branch_row_still_opens_the_base_picker() {
+    fn selecting_the_branch_row_reviews_against_mainline() {
         let mut picker = CommitPicker::new(
             vec![commit("source", Some("parent")), commit("parent", None)],
             Some(stack("origin/main", "parent", "source", 2)),
+            vec![
+                branch_ref("origin/other", "other-tip"),
+                branch_ref("origin/main", "parent-tip"),
+            ],
+            false,
         );
+
+        picker.handle_key(key(KeyCode::Char('j')));
         picker.handle_key(key(KeyCode::Char('j')));
         assert!(
-            picker.handle_key(key(KeyCode::Enter)).is_none(),
-            "choosing a commit under the branch row must still open the base picker"
+            matches!(picker.source_row(picker.selected()), SourceRow::Branch),
+            "moving to the last source row must select the whole-branch option"
         );
         assert!(
-            matches!(
-                picker.step,
-                PickerStep::Base {
-                    source: 0,
-                    selected: 1
-                }
-            ),
-            "the base picker must use the selected commit, not the branch row index"
+            picker.handle_key(key(KeyCode::Enter)).is_none(),
+            "choosing this branch must open the base picker"
         );
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::Branch,
+                selected: 0
+            },
+            "the branch source must preselect detected mainline as the base"
+        );
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            Some(PickerChoice::Review(ReviewTarget {
+                base: ReviewBase::Branch {
+                    name: "origin/main".to_owned(),
+                    tip_sha: "parent-tip".to_owned(),
+                },
+                source: ReviewSource::Commit("source".to_owned()),
+            })),
+            "confirming mainline must review the branch tip against that branch"
+        );
+    }
+
+    #[test]
+    fn selecting_a_branch_as_base_reviews_against_that_branch_tip() {
+        let mut picker = CommitPicker::new(
+            vec![commit("source", Some("parent")), commit("parent", None)],
+            Some(stack("origin/main", "parent", "source", 2)),
+            vec![branch_ref("origin/main", "parent-tip")],
+            false,
+        );
+
+        picker.handle_key(key(KeyCode::Enter));
+        picker.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            Some(PickerChoice::Review(ReviewTarget {
+                base: ReviewBase::Branch {
+                    name: "origin/main".to_owned(),
+                    tip_sha: "parent-tip".to_owned(),
+                },
+                source: ReviewSource::Commit("source".to_owned()),
+            })),
+            "a branch base must keep the branch tip so prepare can use the merge base"
+        );
+    }
+
+    #[test]
+    fn dirty_source_picker_lists_uncommitted_but_defaults_to_head() {
+        let mut picker = CommitPicker::new(
+            vec![commit("source", Some("parent")), commit("parent", None)],
+            None,
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(
+            picker.item_count(),
+            3,
+            "a dirty tree must add an uncommitted source row"
+        );
+        assert!(
+            matches!(picker.step, PickerStep::Source { selected: 1 }),
+            "HEAD must stay the default source when uncommitted work is listed"
+        );
+        assert!(
+            matches!(picker.source_row(0), SourceRow::WorkingTree),
+            "uncommitted changes must be offered as a source"
+        );
+
+        picker.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            picker.handle_key(key(KeyCode::Enter)).is_none(),
+            "choosing uncommitted must open the base picker"
+        );
+        assert_eq!(
+            picker.step,
+            PickerStep::Base {
+                source: SourceRow::WorkingTree,
+                selected: 0
+            },
+            "the working tree must default to HEAD as its base"
+        );
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            Some(PickerChoice::Review(ReviewTarget {
+                base: ReviewBase::Commit("source".to_owned()),
+                source: ReviewSource::WorkingTree,
+            })),
+            "confirming HEAD must review the working tree against the current commit"
+        );
+    }
+
+    #[test]
+    fn backing_out_of_the_base_picker_restores_the_source_row() {
+        let mut picker = CommitPicker::new(
+            vec![commit("source", Some("parent")), commit("parent", None)],
+            Some(stack("origin/main", "parent", "source", 2)),
+            vec![branch_ref("origin/main", "parent-tip")],
+            true,
+        );
+
+        assert!(
+            matches!(picker.step, PickerStep::Source { selected: 1 }),
+            "dirty HEAD must be selected after the uncommitted row"
+        );
+        picker.handle_key(key(KeyCode::Enter));
+        picker.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            picker.step,
+            PickerStep::Source { selected: 1 },
+            "Esc in the base picker must return to the same source row, not the working-tree row"
+        );
+    }
+
+    fn picker(commits: Vec<CommitLogEntry>, branch: Option<BranchStack>) -> CommitPicker {
+        CommitPicker::new(commits, branch, Vec::new(), false)
     }
 
     #[test]
@@ -780,7 +1083,7 @@ mod tests {
 
     #[test]
     fn selecting_a_tree_row_maps_to_the_commit_sha() {
-        let mut picker = CommitPicker::new(
+        let mut picker = picker(
             vec![
                 commit_with_parents("merge", &["main", "side"]),
                 commit("side", Some("main")),
@@ -808,30 +1111,34 @@ mod tests {
         let PickerStep::Base { source, selected } = picker.step else {
             panic!("choosing a tree row must open the base picker");
         };
+        let SourceRow::Commit(source) = source else {
+            panic!("the selected tree row must map to a commit, got {source:?}");
+        };
         assert_eq!(
             picker.commits[source].sha, "side",
             "j/k must select the side commit, not a graph decoration"
         );
+        let BaseRow::Commit(selected) = picker.base_row(SourceRow::Commit(source), selected) else {
+            panic!("the default base must be a commit");
+        };
         assert_eq!(
             picker.commits[selected].sha, "main",
             "the base picker must still preselect the chosen commit's first parent"
         );
 
-        match picker.handle_key(key(KeyCode::Enter)) {
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
             Some(PickerChoice::Review(ReviewTarget {
-                base_sha,
-                source_sha,
-            })) => {
-                assert_eq!(source_sha, "side");
-                assert_eq!(base_sha, "main");
-            }
-            other => panic!("expected a commit range review, got {other:?}"),
-        }
+                base: ReviewBase::Commit("main".to_owned()),
+                source: ReviewSource::Commit("side".to_owned()),
+            })),
+            "confirming the tree row must review that commit against its first parent"
+        );
     }
 
     #[test]
-    fn branch_shortcut_stays_above_the_commit_tree() {
-        let picker = CommitPicker::new(
+    fn branch_shortcut_stays_below_the_commit_tree() {
+        let picker = picker(
             vec![
                 commit_with_parents("merge", &["main", "side"]),
                 commit("side", Some("main")),
@@ -843,20 +1150,24 @@ mod tests {
         assert_eq!(
             picker.item_count(),
             4,
-            "the branch shortcut must remain a header row above the tree"
+            "the branch shortcut must remain a non-graph row beside the tree"
         );
         assert!(
-            matches!(picker.source_row(0), super::SourceRow::Branch),
-            "row 0 must stay the branch-stack shortcut, not a fake commit node"
+            matches!(picker.source_row(0), SourceRow::Commit(0)),
+            "row 0 must be HEAD, not the whole-branch shortcut"
         );
         assert!(
-            matches!(picker.source_row(2), super::SourceRow::Commit(1)),
-            "tree rows under the shortcut must still map to commit indices"
+            matches!(picker.source_row(3), SourceRow::Branch),
+            "the whole-branch option must sit after the commit tree, not as a fake commit node"
+        );
+        assert!(
+            matches!(picker.source_row(2), SourceRow::Commit(2)),
+            "tree rows above the shortcut must still map to commit indices"
         );
         assert_eq!(
             trimmed_graph(&picker.commits),
             vec!["*─┐", "├─*", "*"],
-            "the commit tree must keep merge geometry under the shortcut row"
+            "the commit tree must keep merge geometry next to the shortcut row"
         );
     }
 
@@ -866,6 +1177,13 @@ mod tests {
             merge_base_sha: merge_base.to_owned(),
             head_sha: head.to_owned(),
             commit_count,
+        }
+    }
+
+    fn branch_ref(name: &str, sha: &str) -> BranchRef {
+        BranchRef {
+            name: name.to_owned(),
+            sha: sha.to_owned(),
         }
     }
 
