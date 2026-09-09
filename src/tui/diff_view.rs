@@ -149,9 +149,6 @@ pub(super) fn comment_index_at(app: &App, column: u16, row: u16) -> Option<usize
         index,
     )?;
     let local = usize::from(row.saturating_sub(top));
-    if local == 0 {
-        return None;
-    }
     let diff_row = *app.diff_rows().get(index)?;
     match diff_row {
         DiffRow::File(_) => None,
@@ -168,6 +165,8 @@ pub(super) fn comment_index_at(app: &App, column: u16, row: u16) -> Option<usize
 
 fn comment_at_unified_offset(app: &App, file: usize, line: usize, local: usize) -> Option<usize> {
     let line = app.diff.files.get(file)?.lines.get(line)?;
+    let comment_local =
+        local.checked_sub(unified_source_row_count(line, app.diff_list.line_width))?;
     let body_width = app
         .diff_list
         .line_width
@@ -177,7 +176,7 @@ fn comment_at_unified_offset(app: &App, file: usize, line: usize, local: usize) 
         app.comment_indices_for_line(line),
         app,
         body_width,
-        local - 1,
+        comment_local,
     )
 }
 
@@ -188,6 +187,7 @@ fn comment_at_side_offset(
     side: Side,
     local: usize,
 ) -> Option<usize> {
+    let comment_local = local.checked_sub(1)?;
     let line = match side {
         Side::Old => row.old_line(),
         Side::New => row.new_line(),
@@ -205,7 +205,7 @@ fn comment_at_side_offset(
         app.comment_indices_for_anchor(file.lines.get(line)?.anchor_on(side)),
         app,
         body_width,
-        local - 1,
+        comment_local,
     )
 }
 
@@ -288,23 +288,20 @@ fn item_lines(app: &App, line: &DiffLine, width: usize, in_visual: bool) -> Vec<
     let covering = app.comments_for_line(line).collect::<Vec<_>>();
     let comments = app.comments_ending_on_line(line).collect::<Vec<_>>();
     let marker = if covering.is_empty() { " " } else { "●" };
-    let old_line = line
-        .old_line
-        .map(|line| line.to_string())
-        .unwrap_or_default();
-    let new_line = line
-        .new_line
-        .map(|line| line.to_string())
-        .unwrap_or_default();
-    let gutter = format!("{marker} {old_line:>5} {new_line:>5} ");
     let mut style = line_style(line.kind);
     if in_visual {
         style = style.bg(Color::DarkGray);
     }
-    let mut rows = vec![Line::from(vec![
-        Span::styled(gutter, Style::default().fg(Color::DarkGray)),
-        Span::styled(display_text(line), style),
-    ])];
+    let gutter_style = Style::default().fg(Color::DarkGray);
+    let mut rows = wrap_prefixed(&unified_gutter(line, marker), &display_text(line), width)
+        .into_iter()
+        .map(|(gutter, chunk)| {
+            Line::from(vec![
+                Span::styled(gutter, gutter_style),
+                Span::styled(chunk, style),
+            ])
+        })
+        .collect::<Vec<_>>();
 
     if app.inline_comments {
         let body_width = width
@@ -320,6 +317,56 @@ fn item_lines(app: &App, line: &DiffLine, width: usize, in_visual: bool) -> Vec<
         }
     }
 
+    rows
+}
+
+fn unified_gutter(line: &DiffLine, marker: &str) -> String {
+    let old_line = line
+        .old_line
+        .map(|line| line.to_string())
+        .unwrap_or_default();
+    let new_line = line
+        .new_line
+        .map(|line| line.to_string())
+        .unwrap_or_default();
+    format!("{marker} {old_line:>5} {new_line:>5} ")
+}
+
+fn unified_source_row_count(line: &DiffLine, width: usize) -> usize {
+    wrap_prefixed(&unified_gutter(line, " "), &display_text(line), width).len()
+}
+
+fn wrap_prefixed(gutter: &str, text: &str, width: usize) -> Vec<(String, String)> {
+    let gutter_width = UnicodeWidthStr::width(gutter);
+    let text_width = width.saturating_sub(gutter_width).max(1);
+    wrap_at_width(text, text_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let lead = if index == 0 {
+                gutter.to_owned()
+            } else {
+                " ".repeat(gutter_width)
+            };
+            (lead, chunk)
+        })
+        .collect()
+}
+
+fn wrap_at_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut rows = Vec::new();
+    let mut remaining = text;
+    while UnicodeWidthStr::width(remaining) > width {
+        let split = byte_index_at_width(remaining, width);
+        rows.push(remaining[..split].to_owned());
+        remaining = &remaining[split..];
+    }
+    rows.push(remaining.to_owned());
     rows
 }
 
@@ -398,11 +445,14 @@ mod tests {
     use crate::diff::{DiffLineKind, ParsedDiff};
 
     use super::super::Mode;
-    use super::{App, item_index_at, item_lines, selected_line_rect, wrap_comment_body};
+    use super::{
+        App, item_index_at, item_lines, selected_line_rect, wrap_at_width, wrap_comment_body,
+    };
     use ratatui::layout::Rect;
 
-    // Ten body columns force both word-boundary and hard-word wrapping.
-    const NARROW_WIDTH: usize = 12;
+    // Gutter is 14 columns. 24 leaves 10 source columns so short fixtures stay on one
+    // row, while comment bodies still wrap at 22.
+    const LINE_WIDTH: usize = 24;
     const DIFF: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
@@ -428,26 +478,25 @@ diff --git a/src/lib.rs b/src/lib.rs
         body.push_str("first exceptionallylong\n\nnext");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        let visible = item_lines(
-            &app,
-            &app.diff.files[0].lines[selected],
-            NARROW_WIDTH,
-            false,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
+        let visible = item_lines(&app, &app.diff.files[0].lines[selected], LINE_WIDTH, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
             visible,
             [
                 "●           1 +new",
                 "┃ first",
-                "┃ exceptiona",
-                "┃ llylong",
+                "┃ exceptionallylong",
                 "┃ ",
                 "┃ next",
             ],
             "inline rows must follow the anchored diff line and fit the available width"
+        );
+        assert_eq!(
+            wrap_comment_body("first exceptionallylong", 10),
+            ["first", "exceptiona", "llylong"],
+            "comment wrapping must still break on words and then hard-wrap long tokens"
         );
         assert_eq!(
             wrap_comment_body("界", 1),
@@ -456,15 +505,10 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
 
         app.inline_comments = false;
-        let hidden = item_lines(
-            &app,
-            &app.diff.files[0].lines[selected],
-            NARROW_WIDTH,
-            false,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
+        let hidden = item_lines(&app, &app.diff.files[0].lines[selected], LINE_WIDTH, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
             hidden,
             ["●           1 +new"],
@@ -509,11 +553,11 @@ diff --git a/src/lib.rs b/src/lib.rs
             "extract both lines".to_owned(),
         ));
 
-        let start_rows = item_lines(&app, &app.diff.files[0].lines[first], NARROW_WIDTH, false)
+        let start_rows = item_lines(&app, &app.diff.files[0].lines[first], LINE_WIDTH, false)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        let end_rows = item_lines(&app, &app.diff.files[0].lines[second], NARROW_WIDTH, false)
+        let end_rows = item_lines(&app, &app.diff.files[0].lines[second], LINE_WIDTH, false)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -525,8 +569,59 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
         assert_eq!(
             end_rows,
-            ["●           2 +second", "┃ extract", "┃ both lines"],
+            ["●           2 +second", "┃ extract both lines"],
             "the last line of a range must show the wrapped comment body"
+        );
+    }
+
+    #[test]
+    fn long_source_lines_wrap_onto_continuation_rows_without_extra_line_numbers() {
+        let app = App::new(ParsedDiff::parse(
+            "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++abcdefghijklmnopqrstuvwxyz
+",
+        ));
+        let selected = app.diff.files[0]
+            .lines
+            .iter()
+            .position(|line| line.kind == DiffLineKind::Addition)
+            .expect("the fixture must contain an added line");
+        // Gutter 14 + 6 source columns force the addition onto five visual rows.
+        const WIDTH: usize = 20;
+        let visible = item_lines(&app, &app.diff.files[0].lines[selected], WIDTH, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            [
+                "            1 +abcde",
+                "              fghijk",
+                "              lmnopq",
+                "              rstuvw",
+                "              xyz",
+            ],
+            "a long source line must wrap in the TUI and keep line numbers on the first row only"
+        );
+        assert_eq!(
+            wrap_at_width("界a", 1),
+            ["界", "a"],
+            "wrapping a wide leading character must still make progress"
+        );
+
+        let area = Rect::new(0, 0, 40, 10);
+        let heights = [visible.len() as u16];
+        assert_eq!(item_index_at(area, &heights, 0, 0), Some(0));
+        assert_eq!(
+            item_index_at(area, &heights, 0, 3),
+            Some(0),
+            "clicks on wrapped source continuation rows must still select that diff item"
         );
     }
 
