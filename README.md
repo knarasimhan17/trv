@@ -56,14 +56,16 @@ If the current branch is ahead of mainline (`origin/main`, `origin/master`,
 `main`, …), `trv` can review the whole stack as one diff, like a GitHub pull
 request. Uncommitted work on that branch is included. `trv --agent` and a dirty
 feature branch take this path directly. On a clean feature branch, the picker
-lists **this branch vs origin/main** first; `Enter` reviews the combined
-commits. Selecting a commit still opens a second picker for its base,
-preselected to the commit's first parent.
+lists **this branch vs origin/main** first as a shortcut above the commit
+graph; `Enter` reviews the combined commits. Selecting a commit still opens a
+second picker for its base, preselected to the commit's first parent. Both
+steps draw the same parent/child tree.
 
 If the working tree has uncommitted changes on mainline, `trv` reviews them
 against `HEAD` directly. If the working tree is clean and HEAD is not ahead of
-mainline, it opens a picker of the latest 200 commits on the current branch.
-Commits not found on any remote-tracking ref are marked as unpushed.
+mainline, it opens a graph-style picker of the latest 200 commits on the
+current branch, using parent links like `git log --graph`. Commits not found
+on any remote-tracking ref are marked as unpushed.
 
 `trv -b` (or `trv --branch`) reviews the current branch against mainline
 directly, including uncommitted changes. `trv -w` (or `trv --working-tree`)
