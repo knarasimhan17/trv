@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -19,12 +19,14 @@ pub(crate) struct Handoff {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Launch {
     Here,
+    ControllingTty,
     Tmux,
     Warp,
     ITerm,
     Kitty,
     TerminalApp,
     WezTerm,
+    Unavailable,
 }
 
 pub(crate) struct HandoffGuard {
@@ -58,30 +60,47 @@ pub(crate) fn inner_handoff() -> Option<Handoff> {
 pub(crate) fn launch_plan(
     inner: bool,
     direct_tty: bool,
+    controlling_tty: bool,
     host: Option<Launch>,
     macos: bool,
+    ssh: bool,
 ) -> Launch {
     if inner || direct_tty {
         Launch::Here
+    } else if ssh && controlling_tty {
+        // Agent captured stdio, but the SSH session still has a tty.
+        Launch::ControllingTty
     } else if let Some(host) = host {
         host
+    } else if ssh {
+        Launch::Unavailable
     } else if macos {
         Launch::TerminalApp
+    } else if controlling_tty {
+        Launch::ControllingTty
     } else {
-        Launch::Here
+        Launch::Unavailable
     }
 }
 
-pub(crate) fn should_spawn() -> bool {
-    !matches!(
-        launch_plan(
-            inner_handoff().is_some(),
-            io::stdin().is_terminal() && io::stdout().is_terminal(),
-            detect_host(),
-            cfg!(target_os = "macos"),
-        ),
-        Launch::Here
+fn planned_launch() -> Launch {
+    let facts = HostFacts::from_env();
+    launch_plan(
+        inner_handoff().is_some(),
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        controlling_tty_is_terminal(),
+        detect_host_from(&facts),
+        cfg!(target_os = "macos"),
+        facts.ssh,
     )
+}
+
+pub(crate) fn should_spawn() -> Result<bool> {
+    match planned_launch() {
+        Launch::Here => Ok(false),
+        Launch::Unavailable => bail!("{}", unavailable_message(session_is_ssh())),
+        _ => Ok(true),
+    }
 }
 
 pub(crate) fn spawn_and_forward(
@@ -102,20 +121,25 @@ pub(crate) fn spawn_and_forward(
     )
     .with_context(|| format!("failed to write {}", script.display()))?;
 
-    match launch_plan(false, false, detect_host(), cfg!(target_os = "macos")) {
+    let mut child = None;
+    match planned_launch() {
         Launch::Tmux => spawn_tmux(&cwd, &script)?,
         Launch::Warp => spawn_warp_tab(&script)?,
         Launch::ITerm => spawn_iterm_tab(&script)?,
         Launch::Kitty => spawn_kitty_tab(&cwd, &script)?,
         Launch::TerminalApp => spawn_terminal_app(&script)?,
         Launch::WezTerm => spawn_wezterm_tab(&cwd, &script)?,
-        Launch::Here => bail!(
-            "trv --agent needs a visible terminal. Run it from a tty, inside Warp, tmux, iTerm, Kitty, or WezTerm, or on macOS (falls back to Terminal.app)."
-        ),
+        Launch::ControllingTty => child = Some(spawn_controlling_tty(&script)?),
+        Launch::Here | Launch::Unavailable => {
+            bail!("{}", unavailable_message(session_is_ssh()))
+        }
     }
 
     eprintln!("trv: review opened; waiting until you quit");
     let status = wait_for_done(&done)?;
+    if let Some(mut child) = child {
+        let _ = child.wait();
+    }
     let status = status.trim();
     if status != "ok" {
         bail!("{status}");
@@ -144,20 +168,72 @@ fn complete_handoff(handoff: &Handoff, formatted: &str) -> Result<()> {
     Ok(())
 }
 
-fn detect_host() -> Option<Launch> {
-    if env::var_os("TMUX").is_some() && tmux_available() {
+#[derive(Debug)]
+struct HostFacts {
+    ssh: bool,
+    inside_tmux: bool,
+    tmux_bin: bool,
+    warp: bool,
+    term_program: Option<String>,
+    kitty_window: bool,
+}
+
+impl HostFacts {
+    fn from_env() -> Self {
+        Self {
+            ssh: session_is_ssh(),
+            inside_tmux: env::var_os("TMUX").is_some(),
+            tmux_bin: tmux_available(),
+            warp: in_warp(),
+            term_program: env::var("TERM_PROGRAM").ok(),
+            kitty_window: env::var_os("KITTY_WINDOW_ID").is_some(),
+        }
+    }
+}
+
+fn detect_host_from(facts: &HostFacts) -> Option<Launch> {
+    if facts.inside_tmux && facts.tmux_bin {
         return Some(Launch::Tmux);
     }
-    if in_warp() {
+    if facts.ssh {
+        // Ignore leaked local GUI env (Warp, iTerm, …) on the remote.
+        return facts.tmux_bin.then_some(Launch::Tmux);
+    }
+    if facts.warp {
         return Some(Launch::Warp);
     }
-    match env::var("TERM_PROGRAM").ok().as_deref() {
+    match facts.term_program.as_deref() {
         Some("iTerm.app") | Some("iTerm2") => Some(Launch::ITerm),
         Some("Apple_Terminal") => Some(Launch::TerminalApp),
         Some("WezTerm") => Some(Launch::WezTerm),
         Some("kitty") => Some(Launch::Kitty),
-        _ if env::var_os("KITTY_WINDOW_ID").is_some() => Some(Launch::Kitty),
+        _ if facts.kitty_window => Some(Launch::Kitty),
         _ => None,
+    }
+}
+
+fn session_is_ssh() -> bool {
+    env::var_os("SSH_CONNECTION").is_some()
+        || env::var_os("SSH_TTY").is_some()
+        || env::var_os("SSH_CLIENT").is_some()
+}
+
+fn controlling_tty_is_terminal() -> bool {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map(|file| file.is_terminal())
+        .unwrap_or(false)
+}
+
+fn unavailable_message(ssh: bool) -> String {
+    if ssh {
+        "trv --agent cannot open a review over SSH without a tty. Run it inside tmux or a real terminal (`ssh -t`)."
+            .to_owned()
+    } else {
+        "trv --agent needs a visible terminal. Run it from a tty, inside Warp, tmux, iTerm, Kitty, or WezTerm, or on macOS (falls back to Terminal.app)."
+            .to_owned()
     }
 }
 
@@ -178,15 +254,62 @@ fn tmux_available() -> bool {
 }
 
 fn spawn_tmux(cwd: &Path, script: &Path) -> Result<()> {
-    let status = Command::new("tmux")
-        .args(tmux_new_window_args(cwd, script))
-        .status()
-        .context("failed to start tmux window")?;
-    if status.success() {
-        Ok(())
+    if env::var_os("TMUX").is_some() {
+        let status = Command::new("tmux")
+            .args(tmux_new_window_args(cwd, script))
+            .status()
+            .context("failed to start tmux window")?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("tmux new-window exited with {status}")
+        }
     } else {
-        bail!("tmux new-window exited with {status}")
+        let output = Command::new("tmux")
+            .args(tmux_new_session_args(cwd, script))
+            .output()
+            .context("failed to start tmux session")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "tmux new-session exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let name = String::from_utf8_lossy(&output.stdout);
+        let name = name.trim();
+        if name.is_empty() {
+            eprintln!("trv: review opened in a tmux session; run `tmux attach` to view it");
+        } else {
+            eprintln!(
+                "trv: review opened in tmux session {name}; run `tmux attach -t {name}` to view it"
+            );
+        }
+        Ok(())
     }
+}
+
+fn spawn_controlling_tty(script: &Path) -> Result<Child> {
+    let tty_in = fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .context("controlling terminal is unavailable")?;
+    let tty_out = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .context("controlling terminal is unavailable")?;
+    let tty_err = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .context("controlling terminal is unavailable")?;
+    Command::new("sh")
+        .arg(script)
+        .stdin(Stdio::from(tty_in))
+        .stdout(Stdio::from(tty_out))
+        .stderr(Stdio::from(tty_err))
+        .spawn()
+        .context("failed to start the review on the controlling terminal")
 }
 
 fn spawn_iterm_tab(script: &Path) -> Result<()> {
@@ -263,6 +386,19 @@ fn tmux_new_window_args(cwd: &Path, script: &Path) -> Vec<String> {
     vec![
         "new-window".to_owned(),
         "-d".to_owned(),
+        "-c".to_owned(),
+        cwd.display().to_string(),
+        format!("sh {}", shell_single_quote(&script.display().to_string())),
+    ]
+}
+
+fn tmux_new_session_args(cwd: &Path, script: &Path) -> Vec<String> {
+    vec![
+        "new-session".to_owned(),
+        "-d".to_owned(),
+        "-P".to_owned(),
+        "-F".to_owned(),
+        "#{session_name}".to_owned(),
         "-c".to_owned(),
         cwd.display().to_string(),
         format!("sh {}", shell_single_quote(&script.display().to_string())),
@@ -399,58 +535,225 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Launch, iterm_tab_script, kitty_launch_args, launch_plan, runner_script,
-        terminal_app_script, tmux_new_window_args, warp_open_args, warp_tab_config,
-        wezterm_spawn_args,
+        HostFacts, Launch, detect_host_from, iterm_tab_script, kitty_launch_args, launch_plan,
+        runner_script, terminal_app_script, tmux_new_session_args, tmux_new_window_args,
+        unavailable_message, warp_open_args, warp_tab_config, wezterm_spawn_args,
     };
+
+    fn local_plan(inner: bool, direct_tty: bool, host: Option<Launch>, macos: bool) -> Launch {
+        launch_plan(inner, direct_tty, false, host, macos, false)
+    }
+
+    fn ssh_facts(
+        inside_tmux: bool,
+        tmux_bin: bool,
+        warp: bool,
+        term_program: Option<&str>,
+        kitty_window: bool,
+    ) -> HostFacts {
+        HostFacts {
+            ssh: true,
+            inside_tmux,
+            tmux_bin,
+            warp,
+            term_program: term_program.map(str::to_owned),
+            kitty_window,
+        }
+    }
 
     #[test]
     fn a_real_tty_runs_in_place() {
         assert_eq!(
-            launch_plan(true, false, Some(Launch::Warp), true),
+            local_plan(true, false, Some(Launch::Warp), true),
             Launch::Here
         );
         assert_eq!(
-            launch_plan(false, true, Some(Launch::ITerm), true),
+            local_plan(false, true, Some(Launch::ITerm), true),
             Launch::Here
+        );
+        assert_eq!(
+            launch_plan(false, true, true, Some(Launch::Warp), true, true),
+            Launch::Here,
+            "a direct tty still runs in place over SSH"
         );
     }
 
     #[test]
     fn agents_without_a_tty_open_a_tab_in_this_window() {
         assert_eq!(
-            launch_plan(false, false, Some(Launch::Tmux), true),
+            local_plan(false, false, Some(Launch::Tmux), true),
             Launch::Tmux
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::Warp), true),
+            local_plan(false, false, Some(Launch::Warp), true),
             Launch::Warp
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::ITerm), true),
+            local_plan(false, false, Some(Launch::ITerm), true),
             Launch::ITerm
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::Kitty), true),
+            local_plan(false, false, Some(Launch::Kitty), true),
             Launch::Kitty
         );
         assert_eq!(
-            launch_plan(false, false, Some(Launch::WezTerm), true),
+            local_plan(false, false, Some(Launch::WezTerm), true),
             Launch::WezTerm
+        );
+        assert_eq!(
+            launch_plan(false, false, true, Some(Launch::Warp), true, false),
+            Launch::Warp,
+            "locally, a Warp tab still wins over /dev/tty"
         );
     }
 
     #[test]
     fn macos_falls_back_to_terminal_app() {
         assert_eq!(
-            launch_plan(false, false, None, true),
+            local_plan(false, false, None, true),
             Launch::TerminalApp,
             "unknown hosts on macOS must still get a Terminal.app window"
         );
         assert_eq!(
-            launch_plan(false, false, None, false),
-            Launch::Here,
+            launch_plan(false, false, true, None, true, false),
+            Launch::TerminalApp,
+            "local macOS still prefers Terminal.app over taking over /dev/tty"
+        );
+        assert_eq!(
+            local_plan(false, false, None, false),
+            Launch::Unavailable,
             "non-macOS without a known host cannot invent a window"
+        );
+        assert_eq!(
+            launch_plan(false, false, true, None, false, false),
+            Launch::ControllingTty,
+            "local Linux can still use /dev/tty when no GUI host exists"
+        );
+    }
+
+    #[test]
+    fn ssh_without_a_tty_uses_the_controlling_terminal() {
+        assert_eq!(
+            launch_plan(false, false, true, None, false, true),
+            Launch::ControllingTty
+        );
+        assert_eq!(
+            launch_plan(false, false, true, Some(Launch::Tmux), false, true),
+            Launch::ControllingTty,
+            "/dev/tty is preferred over tmux when both exist"
+        );
+        assert_eq!(
+            launch_plan(false, false, true, None, true, true),
+            Launch::ControllingTty,
+            "SSH onto a Mac must not open Terminal.app"
+        );
+    }
+
+    #[test]
+    fn ssh_ignores_leaked_gui_host_env() {
+        for facts in [
+            ssh_facts(false, false, true, Some("WarpTerminal"), false),
+            ssh_facts(false, false, false, Some("iTerm.app"), false),
+            ssh_facts(false, false, false, Some("Apple_Terminal"), false),
+            ssh_facts(false, false, false, Some("WezTerm"), false),
+            ssh_facts(false, false, false, Some("kitty"), true),
+        ] {
+            assert_eq!(
+                detect_host_from(&facts),
+                None,
+                "SSH must ignore leaked GUI env {facts:?}",
+            );
+            assert_eq!(
+                launch_plan(false, false, true, detect_host_from(&facts), true, true),
+                Launch::ControllingTty,
+            );
+            assert_eq!(
+                launch_plan(false, false, false, detect_host_from(&facts), true, true),
+                Launch::Unavailable,
+                "leaked Warp/iTerm env must not spawn a GUI over SSH"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_uses_tmux_when_the_controlling_tty_is_missing() {
+        let inside = ssh_facts(true, true, true, Some("WarpTerminal"), false);
+        assert_eq!(detect_host_from(&inside), Some(Launch::Tmux));
+        assert_eq!(
+            launch_plan(false, false, false, detect_host_from(&inside), true, true),
+            Launch::Tmux
+        );
+
+        let available = ssh_facts(false, true, false, None, false);
+        assert_eq!(
+            detect_host_from(&available),
+            Some(Launch::Tmux),
+            "SSH may start a tmux session even when not already inside tmux"
+        );
+        assert_eq!(
+            launch_plan(
+                false,
+                false,
+                false,
+                detect_host_from(&available),
+                false,
+                true
+            ),
+            Launch::Tmux
+        );
+    }
+
+    #[test]
+    fn ssh_with_nothing_errors_instead_of_opening_warp() {
+        let facts = ssh_facts(false, false, true, Some("WarpTerminal"), false);
+        assert_eq!(detect_host_from(&facts), None);
+        assert_eq!(
+            launch_plan(false, false, false, detect_host_from(&facts), true, true),
+            Launch::Unavailable
+        );
+        let message = unavailable_message(true);
+        assert!(message.contains("SSH"), "{message}");
+        assert!(message.contains("tmux"), "{message}");
+        assert!(
+            !message.contains("Warp"),
+            "the SSH error must not tell the user to open Warp: {message}"
+        );
+    }
+
+    #[test]
+    fn local_host_detection_still_sees_warp_and_tmux() {
+        let warp = HostFacts {
+            ssh: false,
+            inside_tmux: false,
+            tmux_bin: true,
+            warp: true,
+            term_program: Some("WarpTerminal".into()),
+            kitty_window: false,
+        };
+        assert_eq!(detect_host_from(&warp), Some(Launch::Warp));
+
+        let tmux = HostFacts {
+            ssh: false,
+            inside_tmux: true,
+            tmux_bin: true,
+            warp: false,
+            term_program: None,
+            kitty_window: false,
+        };
+        assert_eq!(detect_host_from(&tmux), Some(Launch::Tmux));
+
+        let tmux_installed_only = HostFacts {
+            ssh: false,
+            inside_tmux: false,
+            tmux_bin: true,
+            warp: false,
+            term_program: None,
+            kitty_window: false,
+        };
+        assert_eq!(
+            detect_host_from(&tmux_installed_only),
+            None,
+            "locally, a tmux binary without TMUX must not steal the macOS Terminal.app fallback"
         );
     }
 
@@ -472,6 +775,19 @@ mod tests {
         assert_eq!(
             tmux_new_window_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
             ["new-window", "-d", "-c", "/repo", "sh '/tmp/run.sh'"]
+        );
+        assert_eq!(
+            tmux_new_session_args(Path::new("/repo"), Path::new("/tmp/run.sh")),
+            [
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}",
+                "-c",
+                "/repo",
+                "sh '/tmp/run.sh'"
+            ]
         );
     }
 

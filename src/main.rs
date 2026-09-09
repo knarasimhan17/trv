@@ -40,7 +40,7 @@ fn run() -> Result<()> {
     match cli.command {
         Some(Command::Revs) => print_revisions(&repository),
         None => {
-            if cli.agent_mode() && agent::should_spawn() {
+            if cli.agent_mode() && agent::should_spawn()? {
                 return agent::spawn_and_forward(
                     cli.working_tree,
                     cli.branch,
