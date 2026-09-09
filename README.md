@@ -128,7 +128,9 @@ multi-line range and then `c` or `Enter` to comment on it, or click an added
 or deleted line to comment on that side.
 `Esc` or `v` cancels an in-progress range. Click an existing comment to edit it,
 `d` to delete the comment on the selected line (including any range that covers
-it), `l` to view comments, `r` to switch between the
+it), `C` to focus the comments panel that lists accumulated comments while you
+read the diff (`j`/`k` move in the panel, `Enter` or a click jumps to that
+line), `l` to view the full comment list, `r` to switch between the
 current review, the interdiff since the last revision (also commentable), and
 frozen revisions,
 `s` to toggle unified or side-by-side layout, `i` to show or hide inline

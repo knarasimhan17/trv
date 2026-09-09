@@ -1,5 +1,6 @@
 mod bindings;
 mod comment_input;
+mod comments_panel;
 mod diff_view;
 mod file_tree;
 mod picker;
@@ -101,6 +102,8 @@ struct App {
     selected_file: usize,
     file_tree_list: DiffListLayout,
     file_tree_area: Rect,
+    comments_panel: CommentsPanelLayout,
+    panel_focused: bool,
     submit_on_quit: bool,
 }
 
@@ -110,6 +113,14 @@ struct DiffListLayout {
     offset: usize,
     heights: Vec<u16>,
     line_width: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommentsPanelLayout {
+    area: Rect,
+    inner: Rect,
+    offset: usize,
+    heights: Vec<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +169,8 @@ impl App {
             selected_file: 0,
             file_tree_list: DiffListLayout::default(),
             file_tree_area: Rect::default(),
+            comments_panel: CommentsPanelLayout::default(),
+            panel_focused: false,
             submit_on_quit: false,
         };
         app.load_view();
@@ -221,6 +234,8 @@ impl App {
         self.diff_list = DiffListLayout::default();
         self.file_tree_list = DiffListLayout::default();
         self.file_tree_area = Rect::default();
+        self.comments_panel = CommentsPanelLayout::default();
+        self.panel_focused = false;
         self.visual = None;
         self.mode = Mode::Diff;
         self.rev_picker = None;
@@ -312,6 +327,8 @@ impl App {
         if matches!(self.mode, Mode::Diff) {
             if self.file_tree_focused {
                 self.handle_file_tree_key(key)
+            } else if self.panel_focused && !self.comments.is_empty() {
+                self.handle_comments_panel_key(key)
             } else {
                 self.handle_diff_key(key)
             }
@@ -404,22 +421,37 @@ impl App {
                 if self.file_tree_visible
                     && file_tree::contains(self.file_tree_area, mouse.column, mouse.row)
                 {
+                    self.panel_focused = false;
                     self.select_file_at_pointer(mouse.row);
+                } else if comments_panel::select_at_pointer(self, mouse.column, mouse.row) {
+                    self.file_tree_focused = false;
+                    return;
                 } else {
                     self.file_tree_focused = false;
+                    self.panel_focused = false;
                     self.select_at_pointer(mouse.column, mouse.row);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.file_tree_focused {
+                if self.file_tree_focused
+                    || (self.file_tree_visible
+                        && file_tree::contains(self.file_tree_area, mouse.column, mouse.row))
+                {
                     self.move_file_tree(true);
+                } else if comments_panel::contains_pointer(self, mouse.column, mouse.row) {
+                    self.move_panel_comment(true);
                 } else {
                     self.move_diff_down();
                 }
             }
             MouseEventKind::ScrollUp => {
-                if self.file_tree_focused {
+                if self.file_tree_focused
+                    || (self.file_tree_visible
+                        && file_tree::contains(self.file_tree_area, mouse.column, mouse.row))
+                {
                     self.move_file_tree(false);
+                } else if comments_panel::contains_pointer(self, mouse.column, mouse.row) {
+                    self.move_panel_comment(false);
                 } else {
                     self.move_diff_up();
                 }
@@ -480,6 +512,7 @@ impl App {
                     self.start_comment();
                 } else if !self.toggle_selected_file() {
                     self.visual = None;
+                    self.panel_focused = false;
                     self.mode = Mode::Comments;
                 }
             }
@@ -489,8 +522,10 @@ impl App {
             bindings::ReviewAction::OpenRevisions => self.open_rev_picker(),
             bindings::ReviewAction::OpenComments => {
                 self.visual = None;
+                self.panel_focused = false;
                 self.mode = Mode::Comments;
             }
+            bindings::ReviewAction::FocusCommentsPanel => self.focus_comments_panel(),
             bindings::ReviewAction::StartVisual => self.toggle_visual(),
             bindings::ReviewAction::ToggleLayout => {
                 self.visual = None;
@@ -514,8 +549,10 @@ impl App {
             }
             bindings::ReviewAction::Quit => return self.request_quit(),
             bindings::ReviewAction::Help => self.help = true,
-            bindings::ReviewAction::ReturnToDiff | bindings::ReviewAction::ActivateFile => {
-                unreachable!("diff keymap cannot contain file-list actions")
+            bindings::ReviewAction::ReturnToDiff
+            | bindings::ReviewAction::ActivateFile
+            | bindings::ReviewAction::JumpToComment => {
+                unreachable!("diff keymap cannot contain panel actions")
             }
         }
         None
@@ -558,6 +595,8 @@ impl App {
             | bindings::ReviewAction::EditComment
             | bindings::ReviewAction::DeleteComment
             | bindings::ReviewAction::OpenComments
+            | bindings::ReviewAction::FocusCommentsPanel
+            | bindings::ReviewAction::JumpToComment
             | bindings::ReviewAction::StartVisual
             | bindings::ReviewAction::ToggleInlineComments
             | bindings::ReviewAction::ToggleLayout
@@ -586,7 +625,10 @@ impl App {
             bindings::ReviewAction::Last => {
                 self.selected_comment = self.comments.len().saturating_sub(1);
             }
-            bindings::ReviewAction::ReturnToDiff => self.mode = Mode::Diff,
+            bindings::ReviewAction::ReturnToDiff => {
+                self.panel_focused = false;
+                self.mode = Mode::Diff;
+            }
             bindings::ReviewAction::OpenRevisions => self.open_rev_picker(),
             bindings::ReviewAction::EditComment => self.edit_selected_comment(),
             bindings::ReviewAction::DeleteComment => {
@@ -610,11 +652,58 @@ impl App {
             | bindings::ReviewAction::ActivateFile
             | bindings::ReviewAction::AddComment
             | bindings::ReviewAction::OpenComments
+            | bindings::ReviewAction::FocusCommentsPanel
+            | bindings::ReviewAction::JumpToComment
             | bindings::ReviewAction::StartVisual
             | bindings::ReviewAction::ToggleInlineComments
             | bindings::ReviewAction::ToggleLayout
             | bindings::ReviewAction::Cancel => {
                 unreachable!("comment-list keymap cannot contain diff actions")
+            }
+        }
+        None
+    }
+
+    fn handle_comments_panel_key(&mut self, key: KeyEvent) -> Option<ReviewOutcome> {
+        let action = bindings::action_for(
+            bindings::review_bindings(bindings::ReviewContext::CommentsPanel),
+            &key,
+        )?;
+        match action {
+            bindings::ReviewAction::MoveDown => self.move_panel_comment(true),
+            bindings::ReviewAction::MoveUp => self.move_panel_comment(false),
+            bindings::ReviewAction::First => self.selected_comment = 0,
+            bindings::ReviewAction::Last => {
+                self.selected_comment = self.comments.len().saturating_sub(1);
+            }
+            bindings::ReviewAction::JumpToComment => self.jump_to_comment(self.selected_comment),
+            bindings::ReviewAction::ReturnToDiff | bindings::ReviewAction::FocusCommentsPanel => {
+                self.panel_focused = false;
+            }
+            bindings::ReviewAction::OpenComments => {
+                self.panel_focused = false;
+                self.mode = Mode::Comments;
+            }
+            bindings::ReviewAction::OpenRevisions => self.open_rev_picker(),
+            bindings::ReviewAction::Export => return self.export_comments(),
+            bindings::ReviewAction::Quit => return self.request_quit(),
+            bindings::ReviewAction::Help => self.help = true,
+            bindings::ReviewAction::NextFile
+            | bindings::ReviewAction::PreviousFile
+            | bindings::ReviewAction::SelectOld
+            | bindings::ReviewAction::SelectNew
+            | bindings::ReviewAction::ToggleFile
+            | bindings::ReviewAction::ToggleFileOrComments
+            | bindings::ReviewAction::AddComment
+            | bindings::ReviewAction::EditComment
+            | bindings::ReviewAction::DeleteComment
+            | bindings::ReviewAction::StartVisual
+            | bindings::ReviewAction::ToggleInlineComments
+            | bindings::ReviewAction::ToggleFileTree
+            | bindings::ReviewAction::ActivateFile
+            | bindings::ReviewAction::ToggleLayout
+            | bindings::ReviewAction::Cancel => {
+                unreachable!("comments-panel keymap cannot contain diff actions")
             }
         }
         None
@@ -626,6 +715,9 @@ impl App {
         }
         match self.visible_view() {
             View::Comments => bindings::ReviewContext::Comments,
+            View::Diff if self.panel_focused && !self.comments.is_empty() => {
+                bindings::ReviewContext::CommentsPanel
+            }
             View::Diff if self.diff_layout == DiffLayout::Unified => {
                 bindings::ReviewContext::Unified
             }
@@ -869,7 +961,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let selected_row = match app.visible_view() {
         View::Diff => {
-            let diff_area = if app.file_tree_visible {
+            let body = if app.file_tree_visible {
                 let width = file_tree::panel_width(content.width);
                 let [tree_area, rest] =
                     Layout::horizontal([Constraint::Length(width), Constraint::Min(1)])
@@ -880,10 +972,22 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                 app.file_tree_area = Rect::default();
                 content
             };
-            diff_view::render(frame, diff_area, app)
+            let panel_height = comments_panel::height(app.comments.len(), body.height);
+            if panel_height == 0 {
+                app.comments_panel = CommentsPanelLayout::default();
+                diff_view::render(frame, body, app)
+            } else {
+                let [diff_area, panel_area] =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(panel_height)])
+                        .areas(body);
+                let selected_row = diff_view::render(frame, diff_area, app);
+                comments_panel::render(frame, panel_area, app);
+                selected_row
+            }
         }
         View::Comments => {
             app.file_tree_area = Rect::default();
+            app.comments_panel = CommentsPanelLayout::default();
             render_comments(frame, content, app);
             None
         }
@@ -975,32 +1079,42 @@ fn footer_text(app: &App) -> String {
         }
     });
     let controls = match app.visible_view() {
+        View::Diff if app.file_tree_focused => {
+            let files_state = if app.file_tree_visible { "on" } else { "off" };
+            format!(
+                "f files: {files_state} | Enter jump | Esc review | {} | {}",
+                app.view_label(),
+                bindings::HELP_HINT
+            )
+        }
+        View::Diff if app.panel_focused && !app.comments.is_empty() => {
+            format!("C/Esc diff | Enter jump | l list | {}", bindings::HELP_HINT)
+        }
         View::Diff => {
             let inline_state = if app.inline_comments { "on" } else { "off" };
             let files_state = if app.file_tree_visible { "on" } else { "off" };
-            if app.file_tree_focused {
+            let comments_hint = if app.comments.is_empty() {
+                String::new()
+            } else {
+                " | C comments".to_owned()
+            };
+            if app.submit_on_quit {
                 format!(
-                    "f files: {files_state} | Enter jump | Esc review | {} | {}",
-                    app.view_label(),
-                    bindings::HELP_HINT
-                )
-            } else if app.submit_on_quit {
-                format!(
-                    "r revs | {} | f files | q send comments | s view: {} | {}",
+                    "r revs | {} | f files | q send comments | s view: {}{comments_hint} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT
                 )
             } else if app.visual.is_some() {
                 format!(
-                    "r revs | {} | s view: {} | {}",
+                    "r revs | {} | s view: {}{comments_hint} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT
                 )
             } else {
                 format!(
-                    "r revs | {} | f files: {files_state} | s view: {} | i inline comments: {inline_state} | {}",
+                    "r revs | {} | f files: {files_state} | s view: {} | i inline comments: {inline_state}{comments_hint} | {}",
                     app.view_label(),
                     app.diff_layout.as_str(),
                     bindings::HELP_HINT
