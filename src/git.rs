@@ -54,6 +54,30 @@ pub(crate) struct BranchStack {
     pub(crate) commit_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BranchRef {
+    pub(crate) name: String,
+    pub(crate) sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSource {
+    WorkingTree,
+    Commit(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewBase {
+    Commit(String),
+    Branch { name: String, tip_sha: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewTarget {
+    pub(crate) base: ReviewBase,
+    pub(crate) source: ReviewSource,
+}
+
 impl Repository {
     pub(crate) fn discover(start: &Path) -> Result<Self> {
         let root = PathBuf::from(
@@ -213,6 +237,60 @@ impl Repository {
         })
     }
 
+    pub(crate) fn list_branches(&self) -> Result<Vec<BranchRef>> {
+        let output = git_text(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)%09%(refname:short)%09%(symref)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+            None,
+            None,
+            false,
+        )
+        .context("failed to list local and remote-tracking branches")?;
+
+        let mut branches = Vec::new();
+        for line in output.lines() {
+            let mut fields = line.splitn(3, '\t');
+            let Some(sha) = fields.next().filter(|sha| !sha.is_empty()) else {
+                continue;
+            };
+            let Some(name) = fields.next().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let symref = fields.next().unwrap_or("");
+            if !symref.is_empty() || name == "HEAD" || name.ends_with("/HEAD") {
+                continue;
+            }
+            branches.push(BranchRef {
+                name: name.to_owned(),
+                sha: sha.to_owned(),
+            });
+        }
+        Ok(branches)
+    }
+
+    pub(crate) fn prepare_picker_target(&self, target: &ReviewTarget) -> Result<PreparedReview> {
+        let source_for_merge = match &target.source {
+            ReviewSource::Commit(sha) => sha.clone(),
+            ReviewSource::WorkingTree => self.resolve_commit("HEAD")?,
+        };
+        let base_sha = match &target.base {
+            ReviewBase::Commit(sha) => sha.clone(),
+            ReviewBase::Branch { tip_sha, .. } => self.merge_base(tip_sha, &source_for_merge)?,
+        };
+        match &target.source {
+            ReviewSource::Commit(sha) => {
+                let revset = format!("{base_sha}..{sha}");
+                self.prepare_review(Some(&revset))
+            }
+            ReviewSource::WorkingTree => self.prepare_working_tree_against(&base_sha),
+        }
+    }
+
     pub(crate) fn prepare_review(&self, revset: Option<&str>) -> Result<PreparedReview> {
         let (base_commit_sha, tree_sha) = match revset {
             Some(revset) => self.prepare_range(revset)?,
@@ -352,6 +430,21 @@ impl Repository {
             false,
         )
         .with_context(|| format!("failed to resolve tree for {commit}"))
+    }
+
+    fn prepare_working_tree_against(&self, base_commit_sha: &str) -> Result<PreparedReview> {
+        let tree_sha = self.capture_working_tree()?.1;
+        let diff = self.diff_trees(base_commit_sha, &tree_sha)?;
+        Ok(PreparedReview {
+            base_commit_sha: base_commit_sha.to_owned(),
+            tree_sha,
+            diff,
+        })
+    }
+
+    fn merge_base(&self, left: &str, right: &str) -> Result<String> {
+        git_text(&self.root, &["merge-base", left, right], None, None, false)
+            .with_context(|| format!("failed to find merge base of {left} and {right}"))
     }
 
     fn detect_mainline(&self) -> Result<Option<String>> {
@@ -539,7 +632,10 @@ fn git_bytes(
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::{CommitLogEntry, Repository, git_text, parse_commit_log};
+    use super::{
+        CommitLogEntry, Repository, ReviewBase, ReviewSource, ReviewTarget, git_text,
+        parse_commit_log,
+    };
 
     #[test]
     fn commit_log_records_preserve_picker_metadata() {
@@ -735,6 +831,110 @@ docs: initial commit\0";
         assert!(
             dirty.diff.contains("+plus") && dirty.diff.contains("+one"),
             "a dirty feature branch must review uncommitted work against mainline: {}",
+            dirty.diff
+        );
+    }
+
+    #[test]
+    fn list_branches_includes_local_and_remote_tracking_refs() {
+        let directory =
+            tempfile::tempdir().expect("temporary repository creation must succeed for this test");
+        let root = directory.path();
+        run_git(root, &["init", "--quiet", "-b", "main"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "--quiet", "-m", "mainline"],
+        );
+        let main_sha = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", &main_sha]);
+        run_git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(root, &["checkout", "--quiet", "-b", "feature"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "--quiet", "-m", "feature"],
+        );
+
+        let repository =
+            Repository::discover(root).expect("the synthetic repository must be discoverable");
+        let branches = repository
+            .list_branches()
+            .expect("branch refs must be readable");
+        let names = branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            names.contains(&"main") && names.contains(&"feature") && names.contains(&"origin/main"),
+            "the picker base list must include local branches and remote-tracking refs, got {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| *name != "HEAD" && !name.ends_with("/HEAD")),
+            "symbolic HEAD refs must not appear as selectable bases, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_picker_target_uses_merge_base_for_a_branch_base() {
+        let directory =
+            tempfile::tempdir().expect("temporary repository creation must succeed for this test");
+        let root = directory.path();
+        run_git(root, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(root.join("file.rs"), "main\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "mainline"]);
+        let main_sha = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", &main_sha]);
+        run_git(root, &["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(root.join("file.rs"), "main\none\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "one"]);
+        std::fs::write(root.join("file.rs"), "main\none\ntwo\n").unwrap();
+        run_git(root, &["add", "file.rs"]);
+        run_git(root, &["commit", "--quiet", "-m", "two"]);
+        let head_sha = run_git(root, &["rev-parse", "HEAD"]);
+
+        let repository =
+            Repository::discover(root).expect("the synthetic repository must be discoverable");
+        let prepared = repository
+            .prepare_picker_target(&ReviewTarget {
+                base: ReviewBase::Branch {
+                    name: "origin/main".to_owned(),
+                    tip_sha: main_sha.clone(),
+                },
+                source: ReviewSource::Commit(head_sha),
+            })
+            .expect("a branch base must resolve through the merge base");
+
+        assert_eq!(prepared.base_commit_sha, main_sha);
+        assert!(
+            prepared.diff.contains("+one") && prepared.diff.contains("+two"),
+            "commit vs origin/main must include the stack since the merge base, got {}",
+            prepared.diff
+        );
+
+        std::fs::write(root.join("file.rs"), "main\none\ntwo\nplus\n").unwrap();
+        let dirty = repository
+            .prepare_picker_target(&ReviewTarget {
+                base: ReviewBase::Branch {
+                    name: "origin/main".to_owned(),
+                    tip_sha: main_sha.clone(),
+                },
+                source: ReviewSource::WorkingTree,
+            })
+            .expect("working tree vs a branch must be preparable");
+        assert!(
+            dirty.diff.contains("+plus") && dirty.diff.contains("+one"),
+            "uncommitted vs origin/main must include the stack and the worktree, got {}",
             dirty.diff
         );
     }

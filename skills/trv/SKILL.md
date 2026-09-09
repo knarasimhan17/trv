@@ -13,7 +13,7 @@ description: >
 
 This is the default way to hand work back to the user in a Git repo. After you make code changes, run the review. Do not ask the user to paste comments.
 
-1. From the repository root, run `trv --agent` in the foreground and wait until it exits. If the current branch is ahead of mainline, this reviews the whole stack (every commit plus uncommitted work) against that mainline, like a pull request. If you have no tty, trv still shows the review in this session without stealing focus (the SSH tty, or a tab in Warp/tmux/iTerm/Kitty/WezTerm); the user will switch to it when ready. Do not background the command. The user may take many minutes; set the command timeout to at least 3600000 ms (1 hour).
+1. From the repository root, run `trv --agent` in the foreground and wait until it exits. Do not run bare `trv`; that opens an interactive commit picker. If the current branch is ahead of mainline, `--agent` skips the picker and reviews the whole stack (every commit plus uncommitted work) against that mainline, like a pull request. If you have no tty, trv still shows the review in this session without stealing focus (the SSH tty, or a tab in Warp/tmux/iTerm/Kitty/WezTerm); the user will switch to it when ready. Do not background the command. The user may take many minutes; set the command timeout to at least 3600000 ms (1 hour).
 2. Empty stdout means they accepted the diff. Do not treat a header with no comments as a review; that payload is never emitted. Otherwise stdout is:
 
    ```
