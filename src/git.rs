@@ -71,6 +71,31 @@ impl Repository {
         &self.git_dir
     }
 
+    pub(crate) fn name(&self) -> &str {
+        self.root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repository")
+    }
+
+    pub(crate) fn describe_commit(&self, sha: &str) -> Option<String> {
+        if let Ok(Some(mainline)) = self.detect_mainline()
+            && self.resolve_commit(&mainline).ok().as_deref() == Some(sha)
+        {
+            return Some(mainline);
+        }
+        if self.resolve_commit("HEAD").ok().as_deref() == Some(sha) {
+            return Some("HEAD".to_owned());
+        }
+        None
+    }
+
+    pub(crate) fn describe_tree(&self, tree_sha: &str) -> Option<String> {
+        let head = self.resolve_commit("HEAD").ok()?;
+        let head_tree = self.commit_tree_sha(&head).ok()?;
+        (head_tree == tree_sha).then(|| "HEAD".to_owned())
+    }
+
     pub(crate) fn current_thread(&self) -> Result<String> {
         git_text(
             &self.root,
@@ -720,6 +745,47 @@ docs: initial commit\0";
                 .expect("mainline detection must succeed"),
             None,
             "HEAD on main with no extra commits is not a stack"
+        );
+    }
+
+    #[test]
+    fn describe_commit_prefers_mainline_names_then_head() {
+        let directory =
+            tempfile::tempdir().expect("temporary repository creation must succeed for this test");
+        let root = directory.path();
+        run_git(root, &["init", "--quiet", "-b", "main"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "--quiet", "-m", "mainline"],
+        );
+        let main_sha = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", &main_sha]);
+        run_git(root, &["checkout", "--quiet", "-b", "feature"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "--quiet", "-m", "feature"],
+        );
+        let head_sha = run_git(root, &["rev-parse", "HEAD"]);
+
+        let repository =
+            Repository::discover(root).expect("the synthetic repository must be discoverable");
+        assert_eq!(
+            repository.name(),
+            root.file_name().and_then(|name| name.to_str()).unwrap()
+        );
+        assert_eq!(
+            repository.describe_commit(&main_sha).as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            repository.describe_commit(&head_sha).as_deref(),
+            Some("HEAD")
+        );
+        assert_eq!(
+            repository
+                .describe_tree(&repository.commit_tree_sha(&head_sha).unwrap())
+                .as_deref(),
+            Some("HEAD")
         );
     }
 

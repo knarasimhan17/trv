@@ -1207,9 +1207,10 @@ fn agent_quit_submits_comments_without_a_confirm_prompt() {
     );
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    let Some(ReviewOutcome::Export(comments)) = outcome else {
+    let Some(ReviewOutcome::Export { comments, view }) = outcome else {
         panic!("q must submit comments to the agent instead of confirming quit");
     };
+    assert_eq!(view, ViewKind::LiveMain);
     assert_eq!(
         comments
             .iter()
@@ -1230,7 +1231,7 @@ fn agent_quit_with_no_comments_still_unblocks_the_agent() {
     app.submit_on_quit = true;
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    let Some(ReviewOutcome::Export(comments)) = outcome else {
+    let Some(ReviewOutcome::Export { comments, .. }) = outcome else {
         panic!("q with no comments must still return an empty export");
     };
     assert!(
@@ -1451,9 +1452,14 @@ fn agent_quit_from_a_frozen_view_sends_the_live_draft_comments() {
     assert!(app.read_only, "frozen revisions stay read-only");
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    let Some(ReviewOutcome::Export(comments)) = outcome else {
+    let Some(ReviewOutcome::Export { comments, view }) = outcome else {
         panic!("q from a frozen view must still submit the live draft");
     };
+    assert_eq!(
+        view,
+        ViewKind::LiveMain,
+        "live draft comments must be labeled as the current vs mainline view"
+    );
     assert_eq!(
         comments
             .iter()
@@ -1461,5 +1467,26 @@ fn agent_quit_from_a_frozen_view_sends_the_live_draft_comments() {
             .collect::<Vec<_>>(),
         ["on the draft"],
         "comments belong to the current round even if the user browsed a frozen rev"
+    );
+}
+
+#[test]
+fn exporting_from_the_interdiff_records_that_view() {
+    let mut app = App::from_session(two_round_session());
+    app.viewing = ViewKind::LiveSince(1);
+    app.load_view();
+    add_line_comment(&mut app, "only the delta");
+
+    let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let Some(ReviewOutcome::Export { comments, view }) = outcome else {
+        panic!("y on the interdiff must export comments");
+    };
+    assert_eq!(view, ViewKind::LiveSince(1));
+    assert_eq!(
+        comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>(),
+        ["only the delta"]
     );
 }
